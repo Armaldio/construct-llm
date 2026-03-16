@@ -189,88 +189,242 @@ async function syncProjectToVectorStore(projectPath: string) {
     });
   }
 
-  // Ensure index exists
   try {
     await mastra.getVector("construct-projects").createIndex({
       indexName: "project_content",
       dimension: 384, // dimension for all-MiniLM-L6-v2
     });
-  } catch (e) {
-    // Index likely already exists
-  }
+  } catch (e) {}
 
-  const filesToIndex = [];
+  const vectorsToUpsert: number[][] = [];
+  const idsToUpsert: string[] = [];
+  const metadataToUpsert: Record<string, any>[] = [];
 
+  const processFileChunks = async (chunks: { text: string; metadata: any }[], filePath: string) => {
+    for (let i = 0; i < chunks.length; i++) {
+      try {
+        const chunk = chunks[i];
+        const res = await embeddingModel.doEmbed({ values: [chunk.text] });
+
+        if (res && res.embeddings && res.embeddings[0]) {
+          const embeddingArray = Array.from(res.embeddings[0] as number[]);
+          vectorsToUpsert.push(embeddingArray);
+          idsToUpsert.push(`${projectPath}-${filePath}-chunk-${i}`.replace(/[^a-zA-Z0-9-]/g, "_"));
+          metadataToUpsert.push(chunk.metadata);
+        }
+      } catch (err) {
+        console.error(`Failed to embed chunk ${i} of ${filePath}:`, err);
+      }
+    }
+  };
+
+  // 1. Process project.c3proj (Generic Text Chunking)
   const c3projPath = path.join(projectPath, "project.c3proj");
   try {
     const stats = await fs.stat(c3projPath);
     if (stats.isFile()) {
       const content = await fs.readFile(c3projPath, "utf8");
-      filesToIndex.push({ path: "project.c3proj", content });
+      const doc = MDocument.fromText(content, {
+        metadata: { path: "project.c3proj", projectPath },
+      });
+      const docChunks = await doc.chunk({ strategy: "recursive", maxSize: 1000, overlap: 100 });
+      console.log(`Processing project.c3proj - ${docChunks.length} chunks`);
+      await processFileChunks(docChunks.map(c => ({ text: c.text, metadata: { text: c.text, path: "project.c3proj", projectPath } })), "project.c3proj");
     }
   } catch (e) {}
 
-  const subDirs = ["layouts", "eventSheets"];
-  for (const dir of subDirs) {
-    const dirPath = path.join(projectPath, dir);
-    try {
-      const files = await fs.readdir(dirPath);
-      for (const file of files) {
-        if (file.endsWith(".json")) {
-          const content = await fs.readFile(path.join(dirPath, file), "utf8");
-          filesToIndex.push({ path: `${dir}/${file}`, content });
-        }
-      }
-    } catch (e) {}
-  }
-
-  for (const file of filesToIndex) {
-    const doc = MDocument.fromText(file.content, {
-      metadata: { path: file.path, projectPath },
-    });
-
-    const chunks = await doc.chunk({
-      strategy: "recursive",
-      maxSize: 1000,
-      overlap: 100,
-    });
-
-    console.log(`Processing ${file.path} - ${chunks.length} chunks`);
-
-    const vectors: number[][] = [];
-    const ids: string[] = [];
-    const metadata: Record<string, any>[] = [];
-
-    for (let i = 0; i < chunks.length; i++) {
+  // 2. Process Event Sheets (Semantic Chunking)
+  const eventSheetsDir = path.join(projectPath, "eventSheets");
+  try {
+    const files = await fs.readdir(eventSheetsDir);
+    for (const file of files) {
+      if (!file.endsWith(".json")) continue;
+      const filePath = `eventSheets/${file}`;
+      const content = await fs.readFile(path.join(eventSheetsDir, file), "utf8");
+      
       try {
-        const chunk = chunks[i];
-        // Local embedding: fast and no rate limits
-        const res = await embeddingModel.doEmbed({ values: [chunk.text] });
+        const data = JSON.parse(content);
+        const sheetName = data.name;
+        const chunks: { text: string; metadata: any }[] = [];
 
-        if (res && res.embeddings && res.embeddings[0]) {
-          // ensure the values are standard JS array of numbers
-          const embeddingArray = Array.from(res.embeddings[0] as number[]);
-          vectors.push(embeddingArray);
-          ids.push(`${projectPath}-${file.path}-chunk-${i}`.replace(/[^a-zA-Z0-9-]/g, "_"));
-          metadata.push({
-            text: chunk.text,
-            path: file.path,
-            projectPath,
+        const processEvent = (event: any, parentStr: string = "") => {
+          if (event.eventType === "block" || event.eventType === "group") {
+            let text = `Event Sheet: ${sheetName}\nType: ${event.eventType}\n`;
+            if (parentStr) text = `${parentStr}\n` + text;
+            if (event.isActive === false) text += `(Disabled)\n`;
+
+            if (event.conditions && event.conditions.length > 0) {
+              text += `Conditions:\n`;
+              event.conditions.forEach((c: any) => {
+                text += `- ${c.objectClass}: ${c.id} ${c.parameters ? JSON.stringify(c.parameters) : ''}\n`;
+              });
+            }
+            if (event.actions && event.actions.length > 0) {
+              text += `Actions:\n`;
+              event.actions.forEach((a: any) => {
+                text += `- ${a.objectClass}: ${a.id} ${a.parameters ? JSON.stringify(a.parameters) : ''}\n`;
+              });
+            }
+
+            chunks.push({
+              text,
+              metadata: { text, path: filePath, projectPath, rawJson: JSON.stringify(event).substring(0, 500) }
+            });
+
+            if (event.children) {
+              event.children.forEach((child: any) => processEvent(child, `Parent Block in ${sheetName}`));
+            }
+          }
+        };
+
+        if (data.events) {
+          data.events.forEach((event: any) => processEvent(event));
+        }
+
+        console.log(`Processing ${filePath} - ${chunks.length} semantic chunks`);
+        await processFileChunks(chunks, filePath);
+      } catch (err) {
+        console.error(`Error parsing JSON for ${filePath}:`, err);
+      }
+    }
+  } catch (e) {}
+
+  // 3. Process Layouts (Semantic Chunking)
+  const layoutsDir = path.join(projectPath, "layouts");
+  try {
+    const files = await fs.readdir(layoutsDir);
+    for (const file of files) {
+      if (!file.endsWith(".json")) continue;
+      const filePath = `layouts/${file}`;
+      const content = await fs.readFile(path.join(layoutsDir, file), "utf8");
+
+      try {
+        const data = JSON.parse(content);
+        const layoutName = data.name;
+        const chunks: { text: string; metadata: any }[] = [];
+
+        if (data.layers) {
+          data.layers.forEach((layer: any) => {
+            const layerName = layer.name;
+            if (layer.instances && layer.instances.length > 0) {
+              layer.instances.forEach((inst: any) => {
+                let text = `Layout: ${layoutName}\nLayer: ${layerName}\n`;
+                text += `Instance Type: ${inst.type}\n`;
+                text += `UID: ${inst.uid}\n`;
+                if (inst.world) text += `Position: ${inst.world.x}, ${inst.world.y}\n`;
+                if (inst.properties) text += `Properties: ${JSON.stringify(inst.properties)}\n`;
+
+                chunks.push({
+                  text,
+                  metadata: { text, path: filePath, projectPath }
+                });
+              });
+            }
           });
         }
+
+        console.log(`Processing ${filePath} - ${chunks.length} semantic chunks`);
+        await processFileChunks(chunks, filePath);
       } catch (err) {
-        console.error(`Failed to embed chunk ${i} of ${file.path}:`, err);
+        console.error(`Error parsing JSON for ${filePath}:`, err);
       }
     }
+  } catch (e) {}
 
-    if (vectors.length > 0) {
-      await mastra.getVector("construct-projects").upsert({
-        indexName: "project_content",
-        vectors,
-        ids,
-        metadata,
-      });
+  // 4. Process Object Types (Semantic Chunking)
+  const objectTypesDir = path.join(projectPath, "objectTypes");
+  try {
+    const files = await fs.readdir(objectTypesDir);
+    for (const file of files) {
+      if (!file.endsWith(".json")) continue;
+      const filePath = `objectTypes/${file}`;
+      const content = await fs.readFile(path.join(objectTypesDir, file), "utf8");
+
+      try {
+        const data = JSON.parse(content);
+        let text = `Object Type: ${data.name}\n`;
+        text += `Plugin ID: ${data["plugin-id"]}\n`;
+        text += `Is Global: ${data.isGlobal}\n`;
+        if (data.instanceVariables && data.instanceVariables.length > 0) {
+          text += `Instance Variables: ${data.instanceVariables.map((v: any) => v.name + " (" + v.type + ")").join(", ")}\n`;
+        }
+        if (data.behaviorTypes && data.behaviorTypes.length > 0) {
+          text += `Behaviors: ${data.behaviorTypes.map((b: any) => b.name + " (" + b["behavior-id"] + ")").join(", ")}\n`;
+        }
+
+        const chunk = {
+          text,
+          metadata: { text, path: filePath, projectPath }
+        };
+
+        console.log(`Processing ${filePath} - 1 semantic chunk`);
+        await processFileChunks([chunk], filePath);
+      } catch (err) {
+        console.error(`Error parsing JSON for ${filePath}:`, err);
+      }
     }
+  } catch (e) {}
+
+  // 5. Process Families (Semantic Chunking)
+  const familiesDir = path.join(projectPath, "families");
+  try {
+    const files = await fs.readdir(familiesDir);
+    for (const file of files) {
+      if (!file.endsWith(".json")) continue;
+      const filePath = `families/${file}`;
+      const content = await fs.readFile(path.join(familiesDir, file), "utf8");
+
+      try {
+        const data = JSON.parse(content);
+        let text = `Family: ${data.name}\n`;
+        if (data.members && data.members.length > 0) {
+          text += `Members: ${data.members.join(", ")}\n`;
+        }
+        if (data.instanceVariables && data.instanceVariables.length > 0) {
+          text += `Instance Variables: ${data.instanceVariables.map((v: any) => v.name + " (" + v.type + ")").join(", ")}\n`;
+        }
+        if (data.behaviorTypes && data.behaviorTypes.length > 0) {
+          text += `Behaviors: ${data.behaviorTypes.map((b: any) => b.name + " (" + b["behavior-id"] + ")").join(", ")}\n`;
+        }
+
+        const chunk = {
+          text,
+          metadata: { text, path: filePath, projectPath }
+        };
+
+        console.log(`Processing ${filePath} - 1 semantic chunk`);
+        await processFileChunks([chunk], filePath);
+      } catch (err) {
+        console.error(`Error parsing JSON for ${filePath}:`, err);
+      }
+    }
+  } catch (e) {}
+
+  // 6. Process Scripts (Text Chunking)
+  const scriptsDir = path.join(projectPath, "scripts");
+  try {
+    const files = await fs.readdir(scriptsDir);
+    for (const file of files) {
+      if (!file.endsWith(".js") && !file.endsWith(".ts")) continue;
+      const filePath = `scripts/${file}`;
+      const content = await fs.readFile(path.join(scriptsDir, file), "utf8");
+
+      const doc = MDocument.fromText(content, {
+        metadata: { path: filePath, projectPath },
+      });
+      const docChunks = await doc.chunk({ strategy: "recursive", maxSize: 1000, overlap: 100 });
+      console.log(`Processing ${filePath} - ${docChunks.length} chunks`);
+      await processFileChunks(docChunks.map(c => ({ text: c.text, metadata: { text: c.text, path: filePath, projectPath } })), filePath);
+    }
+  } catch (e) {}
+
+  if (vectorsToUpsert.length > 0) {
+    await mastra.getVector("construct-projects").upsert({
+      indexName: "project_content",
+      vectors: vectorsToUpsert,
+      ids: idsToUpsert,
+      metadata: metadataToUpsert,
+    });
   }
 
   console.log("Indexing complete.");
@@ -300,6 +454,10 @@ function startWatchingProject(projectPath: string) {
       path.join(projectPath, "project.c3proj"),
       path.join(projectPath, "layouts", "*.json"),
       path.join(projectPath, "eventSheets", "*.json"),
+      path.join(projectPath, "objectTypes", "*.json"),
+      path.join(projectPath, "families", "*.json"),
+      path.join(projectPath, "scripts", "*.js"),
+      path.join(projectPath, "scripts", "*.ts"),
     ],
     {
       persistent: true,
@@ -414,7 +572,7 @@ app.on("ready", async () => {
     return null;
   });
 
-  ipcMain.handle("ask-question", async (_event, question: string) => {
+  ipcMain.handle("ask-question", async (_event, messages: any[]) => {
     try {
       if (!appState.activeProjectId) return "Please load a project first.";
       const project = appState.projects.find(
@@ -427,7 +585,7 @@ app.on("ready", async () => {
         return "Error: MISTRAL_API_KEY not found.";
 
       let fullText = "";
-      const result = await agent.stream(question);
+      const result = await agent.stream(messages);
       const reader = result.fullStream.getReader();
 
       while (true) {

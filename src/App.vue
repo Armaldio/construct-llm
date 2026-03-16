@@ -202,7 +202,10 @@ const sendMessage = async () => {
   scrollToBottom();
 
   try {
-    const finalResponse = await (window as any).api.askQuestion(content);
+    const messagesToSend = thread.messages
+      .filter(m => m.content !== '')
+      .map(m => ({ role: m.role, content: m.content }));
+    const finalResponse = await (window as any).api.askQuestion(messagesToSend);
     // Ensure final text is set in case streaming missed some chunks or wasn't used
     const lastMsg = thread.messages[thread.messages.length - 1];
     if (lastMsg && lastMsg.role === 'assistant') {

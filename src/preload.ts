@@ -5,7 +5,7 @@ contextBridge.exposeInMainWorld('api', {
   updateAppState: (state: any) => ipcRenderer.invoke('update-app-state', state),
   selectProject: () => ipcRenderer.invoke('select-project'),
   deleteProject: (projectId: string) => ipcRenderer.invoke('delete-project', projectId),
-  askQuestion: (question: string) => ipcRenderer.invoke('ask-question', question),
+  askQuestion: (messages: any[]) => ipcRenderer.invoke('ask-question', messages),
   onIndexingStatus: (callback: (data: any) => void) => {
     ipcRenderer.on('indexing-status', (_event, data) => callback(data));
   },
