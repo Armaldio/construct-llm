@@ -222,6 +222,89 @@ const sendMessage = async () => {
   }
 };
 
+const parseMessageContent = (content: string) => {
+  if (!content) return [];
+  const segments: Array<{ type: 'text' | 'c3-clipboard', content: string }> = [];
+  const searchStr = '{"is-c3-clipboard-data":true';
+  
+  let lastIndex = 0;
+  
+  while (true) {
+    const startIndex = content.indexOf(searchStr, lastIndex);
+    if (startIndex === -1) {
+      if (lastIndex < content.length) {
+        segments.push({ type: 'text', content: content.substring(lastIndex) });
+      }
+      break;
+    }
+
+    let depth = 0;
+    let endIndex = -1;
+    let inString = false;
+    let escape = false;
+
+    for (let i = startIndex; i < content.length; i++) {
+      const char = content[i];
+      
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      
+      if (char === '\\') {
+        escape = true;
+        continue;
+      }
+      
+      if (char === '"') {
+        inString = !inString;
+        continue;
+      }
+      
+      if (!inString) {
+        if (char === '{') depth++;
+        else if (char === '}') depth--;
+      }
+      
+      if (depth === 0) {
+        endIndex = i;
+        break;
+      }
+    }
+
+    let blockStartIndex = startIndex;
+    let blockEndIndex = endIndex !== -1 ? endIndex + 1 : content.length;
+
+    // Remove wrapping markdown code blocks if present
+    const textBefore = content.substring(lastIndex, startIndex);
+    const matchBefore = textBefore.match(/```(?:json)?\s*$/);
+    if (matchBefore && endIndex !== -1) {
+      const textAfter = content.substring(blockEndIndex);
+      const matchAfter = textAfter.match(/^\s*```/);
+      if (matchAfter) {
+        blockStartIndex = startIndex - matchBefore[0].length;
+        blockEndIndex = blockEndIndex + matchAfter[0].length;
+      }
+    }
+
+    if (blockStartIndex > lastIndex) {
+      segments.push({ type: 'text', content: content.substring(lastIndex, blockStartIndex) });
+    }
+
+    const jsonContent = content.substring(startIndex, endIndex !== -1 ? endIndex + 1 : content.length);
+    segments.push({ type: 'c3-clipboard', content: jsonContent });
+    
+    lastIndex = blockEndIndex;
+    if (endIndex === -1) break; // Handle incomplete JSON during streaming
+  }
+  
+  return segments;
+};
+
+const copyToClipboard = (text: string) => {
+  navigator.clipboard.writeText(text);
+};
+
 </script>
 
 <template>
@@ -306,8 +389,25 @@ const sendMessage = async () => {
             <Card v-if="msg.content || msg.role === 'user'">
               <template #content>
                 <div class="message-content">
-                  <strong>{{ msg.role === 'user' ? 'You' : 'Assistant' }}:</strong>
-                  <div v-if="msg.role === 'assistant'" class="markdown-body" v-html="md.render(msg.content || '...')"></div>
+                  <div class="message-header">
+                    <strong>{{ msg.role === 'user' ? 'You' : 'Assistant' }}:</strong>
+                    <Button icon="pi pi-copy" text rounded size="small" @click="copyToClipboard(msg.content)" v-tooltip="'Copy message'" />
+                  </div>
+                  <div v-if="msg.role === 'assistant'" class="markdown-body">
+                    <template v-for="(segment, sIndex) in parseMessageContent(msg.content)" :key="sIndex">
+                      <div v-if="segment.type === 'text'" v-html="md.render(segment.content || '...')"></div>
+                      <div v-else class="c3-clipboard-block">
+                        <div class="c3-block-header">
+                          <div class="flex items-center gap-2">
+                            <i class="pi pi-clone text-primary"></i>
+                            <span class="font-bold">Construct 3 Events</span>
+                          </div>
+                          <Button label="Copy to C3" icon="pi pi-copy" size="small" class="p-button-sm" @click="copyToClipboard(segment.content)" />
+                        </div>
+                        <pre class="c3-preview">{{ segment.content }}</pre>
+                      </div>
+                    </template>
+                  </div>
                   <p v-else>{{ msg.content }}</p>
                 </div>
               </template>
@@ -449,6 +549,7 @@ const sendMessage = async () => {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  min-width: 0;
 }
 
 .chat-header {
@@ -466,6 +567,7 @@ const sendMessage = async () => {
   flex: 1;
   padding: 1rem;
   overflow-y: auto;
+  overflow-x: hidden;
   scroll-behavior: smooth;
 }
 
@@ -473,10 +575,12 @@ const sendMessage = async () => {
   display: flex;
   flex-direction: column;
   gap: 1rem;
+  width: 100%;
 }
 
 .message {
   max-width: 85%;
+  min-width: 0;
 }
 
 .message.user {
@@ -506,18 +610,66 @@ const sendMessage = async () => {
   align-items: center;
 }
 
-.message-content strong {
-  display: block;
-  margin-bottom: 0.25rem;
+.message-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+
+.message-header strong {
   font-size: 0.75rem;
   color: #6c757d;
   text-transform: uppercase;
+  margin: 0;
+}
+
+.message-content {
+  min-width: 0;
+  overflow-wrap: break-word;
 }
 
 .message-content p {
   margin: 0;
   line-height: 1.5;
   white-space: pre-wrap;
+}
+
+.c3-clipboard-block {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  overflow: hidden;
+  margin: 1rem 0;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+  min-width: 0;
+}
+
+.c3-block-header {
+  background: #f8fafc;
+  padding: 0.5rem 0.75rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.c3-block-header span {
+  font-size: 0.85rem;
+  color: #334155;
+}
+
+.c3-preview {
+  padding: 0.75rem;
+  margin: 0;
+  font-size: 0.75rem;
+  color: #64748b;
+  max-height: 100px;
+  overflow: auto;
+  background: #ffffff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  white-space: pre;
+  word-break: normal;
 }
 
 /* Markdown Styles */
