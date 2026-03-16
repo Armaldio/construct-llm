@@ -90,3 +90,6 @@ typings/
 
 # Electron-Forge
 out/
+
+examples
+construct-llm.db*

@@ -20,9 +20,10 @@ This project is an Electron-based desktop application acting as a Retrieval-Augm
 - **Vue 3:** Exclusively use the Composition API with `<script setup>`. Avoid the Options API.
 - **PrimeVue:** Utilize PrimeVue components for a consistent and accessible UI. Adhere to their styling and theming guidelines.
 - **TypeScript:** Enforce strict typing. Avoid `any`. Define clear interfaces for IPC payloads, Construct 3 project structures, and Mastra.ai interactions.
-- **Electron IPC:** 
+- **Electron IPC:**
   - Maintain a strict separation of concerns between the Main process and the Renderer process.
   - All heavy lifting, file system operations, and Mastra.ai interactions MUST occur in the Main process.
   - Use contextBridge in the preload script to expose specific, typed, and secure APIs to the Renderer process. Never enable `nodeIntegration` in the renderer.
 - **Mastra.ai Integration:** Structure the RAG pipelines, agents, and vector storage cleanly within the main process. Ensure non-blocking operations so the Electron UI remains responsive during LLM interactions.
 - **State Management:** Use standard Vue reactivity (e.g., `ref`, `reactive`, or Pinia if needed) to manage chat threads, messages, and the currently loaded project state in the frontend.
+- When you need to query docs, use Context7 MCP
