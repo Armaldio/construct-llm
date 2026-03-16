@@ -116,20 +116,7 @@ const vectorQueryTool = createVectorQueryTool({
 const agent = new Agent({
   id: "construct-llm-agent",
   name: "Construct 3 Expert",
-  instructions: `
-    You are an expert in the Construct 3 game engine.
-    You have access to a tool to query the contents of the currently loaded project.
-    Always search the project content before answering questions about it.
-    Be technical, concise, and helpful.
-
-    When providing event logic or actions that the user can copy into Construct 3, use the Construct 3 Clipboard JSON format. 
-    It must be a single line (minified) JSON object starting with {"is-c3-clipboard-data":true}.
-
-    Example for clicking a button to go to a layout:
-    {"is-c3-clipboard-data":true,"type":"events","items":[{"eventType":"block","conditions":[{"id":"on-clicked","objectClass":"MyButton"}],"actions":[{"id":"go-to-layout","objectClass":"System","parameters":{"layout":"NextLayout"}}]}]}
-
-    The "objectClass" should match the objects in the project. If unsure, query the project content first.
-  `,
+  instructions: baseInstructions,
   model: mistral("mistral-large-latest"),
   tools: {
     vectorQueryTool,
@@ -146,6 +133,58 @@ const mastra = new Mastra({
 // --- Helper Functions ---
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function getProjectSkeleton(projectPath: string): Promise<string> {
+  const c3projPath = path.join(projectPath, "project.c3proj");
+  try {
+    const content = await fs.readFile(c3projPath, "utf8");
+    const data = JSON.parse(content);
+
+    let skeleton = `\n\n### CURRENT PROJECT STRUCTURE: ${data.name || "Untitled"}\n`;
+    
+    if (data.layouts?.items) {
+      skeleton += `**Layouts:** ${data.layouts.items.join(", ")}\n`;
+    }
+    if (data.eventSheets?.items) {
+      skeleton += `**Event Sheets:** ${data.eventSheets.items.join(", ")}\n`;
+    }
+    if (data.objectTypes?.items) {
+      skeleton += `**Object Types:** ${data.objectTypes.items.join(", ")}\n`;
+    }
+    if (data.families?.items) {
+      const families = data.families.items.map((f: any) => `${f.name} (members: ${f.members.join(", ")})`);
+      skeleton += `**Families:** ${families.join("; ")}\n`;
+    }
+    if (data.timelines?.items) {
+      skeleton += `**Timelines:** ${data.timelines.items.join(", ")}\n`;
+    }
+
+    return skeleton;
+  } catch (e) {
+    return "";
+  }
+}
+
+const baseInstructions = `
+    You are an expert in the Construct 3 game engine.
+    You have access to a tool to query the contents of the currently loaded project.
+    Always search the project content before answering questions about it.
+    Be technical, concise, and helpful.
+
+    When providing event logic or actions that the user can copy into Construct 3, use the Construct 3 Clipboard JSON format. 
+    It must be a single line (minified) JSON object starting with {"is-c3-clipboard-data":true}.
+
+    Example for clicking a button to go to a layout:
+    {"is-c3-clipboard-data":true,"type":"events","items":[{"eventType":"block","conditions":[{"id":"on-clicked","objectClass":"MyButton"}],"actions":[{"id":"go-to-layout","objectClass":"System","parameters":{"layout":"NextLayout"}}]}]}
+
+    The "objectClass" should match the objects in the project. If unsure, query the project content first.
+`;
+
+async function updateAgentInstructions(projectPath: string) {
+  const skeleton = await getProjectSkeleton(projectPath);
+  (agent as any).instructions = baseInstructions + skeleton;
+  console.log("Agent instructions updated with project skeleton.");
+}
 
 async function withRateLimitRetry<T>(
   fn: () => Promise<T>,
@@ -418,6 +457,35 @@ async function syncProjectToVectorStore(projectPath: string) {
     }
   } catch (e) {}
 
+  // 7. Process Timelines (Semantic Chunking)
+  const timelinesDir = path.join(projectPath, "timelines");
+  try {
+    const files = await fs.readdir(timelinesDir);
+    for (const file of files) {
+      if (!file.endsWith(".json")) continue;
+      const filePath = `timelines/${file}`;
+      const content = await fs.readFile(path.join(timelinesDir, file), "utf8");
+
+      try {
+        const data = JSON.parse(content);
+        let text = `Timeline: ${data.name}\n`;
+        if (data.tracks) {
+          text += `Tracks: ${data.tracks.length}\n`;
+        }
+
+        const chunk = {
+          text,
+          metadata: { text, path: filePath, projectPath }
+        };
+
+        console.log(`Processing ${filePath} - 1 semantic chunk`);
+        await processFileChunks([chunk], filePath);
+      } catch (err) {
+        console.error(`Error parsing JSON for ${filePath}:`, err);
+      }
+    }
+  } catch (e) {}
+
   if (vectorsToUpsert.length > 0) {
     await mastra.getVector("construct-projects").upsert({
       indexName: "project_content",
@@ -437,6 +505,7 @@ async function syncProjectToVectorStore(projectPath: string) {
 }
 
 const debouncedSync = debounce((projectPath: string) => {
+  updateAgentInstructions(projectPath).catch(() => {});
   syncProjectToVectorStore(projectPath).catch((err) => {
     console.error("Failed to sync project:", err);
   });
@@ -456,6 +525,7 @@ function startWatchingProject(projectPath: string) {
       path.join(projectPath, "eventSheets", "*.json"),
       path.join(projectPath, "objectTypes", "*.json"),
       path.join(projectPath, "families", "*.json"),
+      path.join(projectPath, "timelines", "*.json"),
       path.join(projectPath, "scripts", "*.js"),
       path.join(projectPath, "scripts", "*.ts"),
     ],
@@ -505,6 +575,13 @@ app.on("ready", async () => {
   console.log("Initializing local embedding model...");
   await xenovaModel.initialize();
   console.log("Local embedding model ready.");
+
+  if (appState.activeProjectId) {
+    const project = appState.projects.find(p => p.id === appState.activeProjectId);
+    if (project) {
+        updateAgentInstructions(project.path).catch(() => {});
+    }
+  }
 
   createWindow();
 
@@ -562,6 +639,7 @@ app.on("ready", async () => {
       appState.activeProjectId = id;
       await saveState();
 
+      await updateAgentInstructions(currentProjectPath);
       startWatchingProject(currentProjectPath);
       syncProjectToVectorStore(currentProjectPath).catch((err) => {
         console.error("Failed to initial sync project:", err);
