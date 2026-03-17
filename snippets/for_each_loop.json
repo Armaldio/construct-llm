@@ -1,0 +1,30 @@
+{
+  "is-c3-clipboard-data": true,
+  "type": "events",
+  "items": [
+    {
+      "eventType": "block",
+      "conditions": [
+        {
+          "id": "for-each",
+          "objectClass": "System",
+          "parameters": {
+            "object": "EnemyBases"
+          }
+        }
+      ],
+      "actions": [
+        {
+          "id": "callFunction",
+          "objectClass": "System",
+          "parameters": {
+            "functionName": "UpdateAI",
+            "parameters": [
+              "EnemyBases.UID"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

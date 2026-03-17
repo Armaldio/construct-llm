@@ -1,0 +1,15 @@
+{
+  "is-c3-clipboard-data": true,
+  "type": "events",
+  "items": [
+    {
+      "eventType": "block",
+      "conditions": [
+        { "id": "on-completed", "objectClass": "AJAX", "parameters": { "tag": "\"load_data\"" } }
+      ],
+      "actions": [
+        { "id": "parse", "objectClass": "JSON", "parameters": { "data": "AJAX.LastData" } }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "is-c3-clipboard-data": true,
+  "type": "events",
+  "items": [
+    {
+      "eventType": "block",
+      "conditions": [
+        {
+          "id": "on-animation-frame-changed",
+          "objectClass": "MySprite"
+        },
+        {
+          "id": "compare-animation-frame",
+          "objectClass": "MySprite",
+          "parameters": {
+            "comparison": 0,
+            "number": "5"
+          }
+        }
+      ],
+      "actions": [
+        {
+          "id": "create-object",
+          "objectClass": "System",
+          "parameters": {
+            "object-to-create": "EffectObject",
+            "layer": "0",
+            "x": "MySprite.X",
+            "y": "MySprite.Y",
+            "create-hierarchy": false,
+            "template-name": "\"\""
+          }
+        }
+      ]
+    }
+  ]
+}

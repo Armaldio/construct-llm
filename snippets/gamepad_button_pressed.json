@@ -1,0 +1,15 @@
+{
+  "is-c3-clipboard-data": true,
+  "type": "events",
+  "items": [
+    {
+      "eventType": "block",
+      "conditions": [
+        { "id": "on-button-pressed", "objectClass": "Gamepad", "parameters": { "gamepad": "0", "button": "button-b" } }
+      ],
+      "actions": [
+        { "id": "go-to-layout", "objectClass": "System", "parameters": { "layout": "Menu" } }
+      ]
+    }
+  ]
+}

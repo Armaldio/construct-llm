@@ -1,0 +1,25 @@
+{
+  "is-c3-clipboard-data": true,
+  "type": "events",
+  "items": [
+    {
+      "eventType": "block",
+      "conditions": [
+        {
+          "id": "on-start-of-layout",
+          "objectClass": "System"
+        }
+      ],
+      "actions": [
+        {
+          "id": "set-group-active",
+          "objectClass": "System",
+          "parameters": {
+            "group-name": "\"MyGroupName\"",
+            "state": "deactivated"
+          }
+        }
+      ]
+    }
+  ]
+}

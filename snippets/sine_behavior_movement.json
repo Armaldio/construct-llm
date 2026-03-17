@@ -1,0 +1,20 @@
+{
+  "is-c3-clipboard-data": true,
+  "type": "events",
+  "items": [
+    {
+      "eventType": "block",
+      "conditions": [
+        { "id": "on-created", "objectClass": "FloatingItem" }
+      ],
+      "actions": [
+        {
+          "id": "set-enabled",
+          "objectClass": "FloatingItem",
+          "behaviorType": "Sine",
+          "parameters": { "state": "enabled" }
+        }
+      ]
+    }
+  ]
+}

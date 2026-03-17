@@ -1,0 +1,24 @@
+{
+  "is-c3-clipboard-data": true,
+  "type": "events",
+  "items": [
+    {
+      "eventType": "block",
+      "conditions": [
+        {
+          "id": "on-clicked",
+          "objectClass": "MyButton"
+        }
+      ],
+      "actions": [
+        {
+          "callFunction": "MyFunctionName",
+          "parameters": [
+            "\"Arg1\"",
+            "100"
+          ]
+        }
+      ]
+    }
+  ]
+}

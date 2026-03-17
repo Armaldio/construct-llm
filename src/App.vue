@@ -6,6 +6,7 @@ import Listbox from 'primevue/listbox';
 import Card from 'primevue/card';
 import Divider from 'primevue/divider';
 import MarkdownIt from 'markdown-it';
+import C3EventPreview from './C3EventPreview.vue';
 
 const md = new MarkdownIt({
   html: true,
@@ -46,6 +47,8 @@ const reflections = ref<string[]>([]);
 const isStreaming = ref(false);
 const inputRef = ref<any>(null);
 const messagesContainer = ref<HTMLElement | null>(null);
+const isStartingUp = ref(true);
+const startupStatus = ref({ step: 'Initializing...', detail: '' });
 
 const scrollToBottom = () => {
   nextTick(() => {
@@ -56,6 +59,21 @@ const scrollToBottom = () => {
 };
 
 onMounted(async () => {
+  // Listen for startup progress
+  (window as any).api.onStartupProgress((data: any) => {
+    startupStatus.value = data;
+  });
+
+  (window as any).api.onStartupComplete(() => {
+    isStartingUp.value = false;
+  });
+
+  // Check if we already finished (useful for HMR)
+  const ready = await (window as any).api.isStartupComplete();
+  if (ready) {
+    isStartingUp.value = false;
+  }
+
   const state = await (window as any).api.getAppState();
   if (state) {
     appState.value = state;
@@ -134,6 +152,18 @@ const loadProject = async () => {
   }
 };
 
+const forceReindex = async () => {
+  if (isIndexing.value) return;
+  await (window as any).api.forceReindex();
+};
+
+const onThreadChange = () => {
+  if (currentProject.value && activeThreadId.value) {
+    activeThread.value = currentProject.value.threads.find(t => t.id === activeThreadId.value) || null;
+    scrollToBottom();
+  }
+};
+
 const selectProject = (id: string) => {
   appState.value.activeProjectId = id;
   activeThreadId.value = null;
@@ -202,10 +232,10 @@ const sendMessage = async () => {
   scrollToBottom();
 
   try {
-    const messagesToSend = thread.messages
-      .filter(m => m.content !== '')
-      .map(m => ({ role: m.role, content: m.content }));
-    const finalResponse = await (window as any).api.askQuestion(messagesToSend);
+    const finalResponse = await (window as any).api.askQuestion({
+      text: content,
+      threadId: activeThreadId.value
+    });
     // Ensure final text is set in case streaming missed some chunks or wasn't used
     const lastMsg = thread.messages[thread.messages.length - 1];
     if (lastMsg && lastMsg.role === 'assistant') {
@@ -228,19 +258,20 @@ const sendMessage = async () => {
 const parseMessageContent = (content: string) => {
   if (!content) return [];
   const segments: Array<{ type: 'text' | 'c3-clipboard', content: string }> = [];
-  const searchStr = '{"is-c3-clipboard-data":true';
+  
+  // Regex to find the start of a C3 clipboard JSON block
+  const startRegex = /\{[\s\n]*"is-c3-clipboard-data"[\s\n]*:[\s\n]*true/g;
   
   let lastIndex = 0;
+  let match;
   
-  while (true) {
-    const startIndex = content.indexOf(searchStr, lastIndex);
-    if (startIndex === -1) {
-      if (lastIndex < content.length) {
-        segments.push({ type: 'text', content: content.substring(lastIndex) });
-      }
-      break;
-    }
-
+  while ((match = startRegex.exec(content)) !== null) {
+    const startIndex = match.index;
+    
+    // Check if we have text before this block
+    let blockStartIndex = startIndex;
+    
+    // Try to find the matching closing brace
     let depth = 0;
     let endIndex = -1;
     let inString = false;
@@ -248,21 +279,9 @@ const parseMessageContent = (content: string) => {
 
     for (let i = startIndex; i < content.length; i++) {
       const char = content[i];
-      
-      if (escape) {
-        escape = false;
-        continue;
-      }
-      
-      if (char === '\\') {
-        escape = true;
-        continue;
-      }
-      
-      if (char === '"') {
-        inString = !inString;
-        continue;
-      }
+      if (escape) { escape = false; continue; }
+      if (char === '\\\\') { escape = true; continue; }
+      if (char === '"') { inString = !inString; continue; }
       
       if (!inString) {
         if (char === '{') depth++;
@@ -275,30 +294,43 @@ const parseMessageContent = (content: string) => {
       }
     }
 
-    let blockStartIndex = startIndex;
-    let blockEndIndex = endIndex !== -1 ? endIndex + 1 : content.length;
-
-    // Remove wrapping markdown code blocks if present
-    const textBefore = content.substring(lastIndex, startIndex);
-    const matchBefore = textBefore.match(/```(?:json)?\s*$/);
-    if (matchBefore && endIndex !== -1) {
-      const textAfter = content.substring(blockEndIndex);
-      const matchAfter = textAfter.match(/^\s*```/);
-      if (matchAfter) {
-        blockStartIndex = startIndex - matchBefore[0].length;
-        blockEndIndex = blockEndIndex + matchAfter[0].length;
-      }
+    if (endIndex === -1) {
+      // Incomplete JSON (maybe still streaming)
+      continue;
     }
 
+    let blockEndIndex = endIndex + 1;
+
+    // Detect if this block is wrapped in markdown code blocks
+    const beforeBlock = content.substring(lastIndex, startIndex);
+    const afterBlock = content.substring(blockEndIndex);
+    
+    const codeBlockStartMatch = beforeBlock.match(/```(?:json)?\s*$/);
+    const codeBlockEndMatch = afterBlock.match(/^\s*```/);
+    
+    if (codeBlockStartMatch && codeBlockEndMatch) {
+      // It's wrapped in backticks, let's include them in the "to be replaced" area
+      blockStartIndex = startIndex - codeBlockStartMatch[0].length;
+      blockEndIndex = blockEndIndex + codeBlockEndMatch[0].length;
+    }
+
+    // Push preceding text segment
     if (blockStartIndex > lastIndex) {
       segments.push({ type: 'text', content: content.substring(lastIndex, blockStartIndex) });
     }
 
-    const jsonContent = content.substring(startIndex, endIndex !== -1 ? endIndex + 1 : content.length);
+    // Push the C3 clipboard segment
+    const jsonContent = content.substring(startIndex, endIndex + 1);
     segments.push({ type: 'c3-clipboard', content: jsonContent });
     
     lastIndex = blockEndIndex;
-    if (endIndex === -1) break; // Handle incomplete JSON during streaming
+    // Reset regex index to after our found block
+    startRegex.lastIndex = lastIndex;
+  }
+  
+  // Push remaining text
+  if (lastIndex < content.length) {
+    segments.push({ type: 'text', content: content.substring(lastIndex) });
   }
   
   return segments;
@@ -311,11 +343,29 @@ const copyToClipboard = (text: string) => {
 </script>
 
 <template>
+  <div v-if="isStartingUp" class="startup-overlay">
+    <div class="startup-content">
+      <div class="startup-logo">
+        <i class="pi pi-bolt text-primary" style="font-size: 3rem"></i>
+      </div>
+      <h1 class="startup-title">Construct LLM</h1>
+      <div class="startup-status">
+        <div class="status-step">{{ startupStatus.step }}</div>
+        <div class="status-detail" v-if="startupStatus.detail">{{ startupStatus.detail }}</div>
+      </div>
+      <div class="startup-loader">
+        <div class="loader-bar"></div>
+      </div>
+    </div>
+  </div>
   <div class="app-container">
     <aside class="sidebar">
       <div class="sidebar-header">
         <h2>Construct LLM</h2>
-        <Button @click="loadProject" label="Open Project" icon="pi pi-plus" class="w-full" size="small" />
+        <div class="flex flex-col gap-2">
+          <Button @click="loadProject" label="Open Project" icon="pi pi-plus" class="w-full" size="small" />
+          <Button v-if="currentProject" @click="forceReindex" label="Re-index Project" :icon="isIndexing ? 'pi pi-spin pi-refresh' : 'pi pi-refresh'" class="w-full p-button-secondary" size="small" :disabled="isIndexing" />
+        </div>
         <div v-if="isIndexing" class="indexing-indicator">
           <i class="pi pi-spin pi-spinner" style="font-size: 0.8rem"></i>
           <span>Indexing project...</span>
@@ -362,6 +412,7 @@ const copyToClipboard = (text: string) => {
           :options="currentProject.threads"
           optionValue="id"
           class="w-full compact-listbox"
+          @change="onThreadChange"
         >
           <template #option="slotProps">
             <div class="project-item">
@@ -407,7 +458,9 @@ const copyToClipboard = (text: string) => {
                           </div>
                           <Button label="Copy to C3" icon="pi pi-copy" size="small" class="p-button-sm" @click="copyToClipboard(segment.content)" />
                         </div>
-                        <pre class="c3-preview">{{ segment.content }}</pre>
+                        <div class="c3-preview-container">
+                          <C3EventPreview :data="JSON.parse(segment.content)" />
+                        </div>
                       </div>
                     </template>
                   </div>
@@ -662,17 +715,12 @@ const copyToClipboard = (text: string) => {
   color: #334155;
 }
 
-.c3-preview {
-  padding: 0.75rem;
+.c3-preview-container {
+  padding: 0;
   margin: 0;
-  font-size: 0.75rem;
-  color: #64748b;
-  max-height: 100px;
+  max-height: 300px;
   overflow: auto;
-  background: #ffffff;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  white-space: pre;
-  word-break: normal;
+  background: white;
 }
 
 /* Markdown Styles */
@@ -750,5 +798,87 @@ const copyToClipboard = (text: string) => {
   display: flex;
   flex-direction: column;
   align-items: center;
+}
+
+/* Startup Overlay */
+.startup-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: #f8fafc;
+  z-index: 9999;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  animation: fadeIn 0.3s ease-out;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.startup-content {
+  text-align: center;
+  max-width: 400px;
+  width: 100%;
+  padding: 2rem;
+}
+
+.startup-logo {
+  margin-bottom: 1.5rem;
+  animation: pulse 2s infinite ease-in-out;
+}
+
+@keyframes pulse {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.1); }
+  100% { transform: scale(1); }
+}
+
+.startup-title {
+  font-size: 2rem;
+  font-weight: 800;
+  color: #1e293b;
+  margin-bottom: 2rem;
+}
+
+.startup-status {
+  margin-bottom: 2rem;
+  min-height: 4rem;
+}
+
+.status-step {
+  font-weight: 600;
+  color: #334155;
+  margin-bottom: 0.5rem;
+}
+
+.status-detail {
+  font-size: 0.85rem;
+  color: #64748b;
+}
+
+.startup-loader {
+  height: 4px;
+  background: #e2e8f0;
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.loader-bar {
+  height: 100%;
+  background: var(--p-primary-color);
+  width: 30%;
+  border-radius: 2px;
+  animation: loading 1.5s infinite ease-in-out;
+}
+
+@keyframes loading {
+  0% { transform: translateX(-100%); width: 30%; }
+  50% { width: 60%; }
+  100% { transform: translateX(400%); width: 30%; }
 }
 </style>

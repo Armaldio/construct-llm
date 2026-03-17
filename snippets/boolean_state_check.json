@@ -1,0 +1,29 @@
+{
+  "is-c3-clipboard-data": true,
+  "type": "events",
+  "items": [
+    {
+      "eventType": "block",
+      "conditions": [
+        {
+          "id": "is-boolean-instance-variable-set",
+          "objectClass": "Player",
+          "parameters": {
+            "instance-variable": "IsInvulnerable"
+          },
+          "isInverted": true
+        }
+      ],
+      "actions": [
+        {
+          "id": "set-boolean-instvar",
+          "objectClass": "Player",
+          "parameters": {
+            "instance-variable": "IsInvulnerable",
+            "value": "true"
+          }
+        }
+      ]
+    }
+  ]
+}

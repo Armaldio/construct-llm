@@ -1,0 +1,15 @@
+{
+  "is-c3-clipboard-data": true,
+  "type": "events",
+  "items": [
+    {
+      "eventType": "block",
+      "conditions": [
+        { "id": "on-fade-out-finished", "objectClass": "FlashMessage", "behaviorType": "Fade" }
+      ],
+      "actions": [
+        { "id": "destroy", "objectClass": "FlashMessage" }
+      ]
+    }
+  ]
+}

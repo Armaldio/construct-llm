@@ -1,0 +1,23 @@
+{
+  "is-c3-clipboard-data": true,
+  "type": "events",
+  "items": [
+    {
+      "eventType": "block",
+      "conditions": [
+        { "id": "on-created", "objectClass": "Attachment" }
+      ],
+      "actions": [
+        {
+          "id": "pin-to-object",
+          "objectClass": "Attachment",
+          "behaviorType": "Pin",
+          "parameters": {
+            "pin-to": "Player",
+            "mode": "position-&-angle"
+          }
+        }
+      ]
+    }
+  ]
+}

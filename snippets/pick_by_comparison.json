@@ -1,0 +1,27 @@
+{
+  "is-c3-clipboard-data": true,
+  "type": "events",
+  "items": [
+    {
+      "eventType": "block",
+      "conditions": [
+        {
+          "id": "pick-by-comparison",
+          "objectClass": "System",
+          "parameters": {
+            "object": "EnemyBases",
+            "expression": "EnemyBases.Health",
+            "comparison": 0,
+            "value": "0"
+          }
+        }
+      ],
+      "actions": [
+        {
+          "id": "destroy",
+          "objectClass": "EnemyBases"
+        }
+      ]
+    }
+  ]
+}

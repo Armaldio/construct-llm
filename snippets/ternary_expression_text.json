@@ -1,0 +1,21 @@
+{
+  "is-c3-clipboard-data": true,
+  "type": "events",
+  "items": [
+    {
+      "eventType": "block",
+      "conditions": [
+        { "id": "compare-instance-variable", "objectClass": "NPC", "parameters": { "instance-variable": "Talked", "comparison": 0, "value": "0" } }
+      ],
+      "actions": [
+        {
+          "id": "set-text",
+          "objectClass": "DialogText",
+          "parameters": {
+            "text": "Self.Talked = 0 ? \"Hello!\" : \"Welcome back!\""
+          }
+        }
+      ]
+    }
+  ]
+}

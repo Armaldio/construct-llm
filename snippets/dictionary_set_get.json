@@ -1,0 +1,30 @@
+{
+  "is-c3-clipboard-data": true,
+  "type": "events",
+  "items": [
+    {
+      "eventType": "block",
+      "conditions": [
+        {
+          "id": "compare-value",
+          "objectClass": "Dictionary",
+          "parameters": {
+            "key": "\"Score\"",
+            "comparison": 4,
+            "value": "100"
+          }
+        }
+      ],
+      "actions": [
+        {
+          "id": "add-key",
+          "objectClass": "Dictionary",
+          "parameters": {
+            "key": "\"Rank\"",
+            "value": "\"Master\""
+          }
+        }
+      ]
+    }
+  ]
+}

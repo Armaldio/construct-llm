@@ -1,0 +1,20 @@
+{
+  "is-c3-clipboard-data": true,
+  "type": "events",
+  "items": [
+    {
+      "eventType": "block",
+      "conditions": [
+        { "id": "is-button-down", "objectClass": "Gamepad", "parameters": { "gamepad": "0", "button": "d-pad-up" } }
+      ],
+      "actions": [
+        {
+          "id": "simulate-control",
+          "objectClass": "Player",
+          "behaviorType": "8Direction",
+          "parameters": { "control": "up" }
+        }
+      ]
+    }
+  ]
+}

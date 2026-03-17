@@ -1,0 +1,24 @@
+{
+  "is-c3-clipboard-data": true,
+  "type": "events",
+  "items": [
+    {
+      "eventType": "block",
+      "conditions": [
+        {
+          "id": "on-clicked",
+          "objectClass": "BackButton"
+        }
+      ],
+      "actions": [
+        {
+          "id": "go-to-layout",
+          "objectClass": "System",
+          "parameters": {
+            "layout": "Menu"
+          }
+        }
+      ]
+    }
+  ]
+}

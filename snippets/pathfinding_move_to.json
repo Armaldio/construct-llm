@@ -1,0 +1,23 @@
+{
+  "is-c3-clipboard-data": true,
+  "type": "events",
+  "items": [
+    {
+      "eventType": "block",
+      "conditions": [
+        { "id": "every-tick", "objectClass": "System" }
+      ],
+      "actions": [
+        {
+          "id": "find-path",
+          "objectClass": "Enemy",
+          "behaviorType": "Pathfinding",
+          "parameters": {
+            "x": "Player.X",
+            "y": "Player.Y"
+          }
+        }
+      ]
+    }
+  ]
+}
