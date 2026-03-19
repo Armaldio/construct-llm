@@ -1,23 +1,19 @@
-console.log("[DEBUG] Main process starting at:", new Date().toISOString());
 import { app, BrowserWindow, ipcMain, dialog, safeStorage } from "electron";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs/promises";
 import started from "electron-squirrel-startup";
-console.log("[DEBUG] Basic imports finished at:", new Date().toISOString());
 
 import { Mastra } from "@mastra/core";
 import { Agent } from "@mastra/core/agent";
 import { LibSQLVector, LibSQLStore } from "@mastra/libsql";
 import { Memory } from "@mastra/memory";
 import { MDocument, createVectorQueryTool } from "@mastra/rag";
-console.log("[DEBUG] Mastra imports finished at:", new Date().toISOString());
 
 import { createMistral } from "@ai-sdk/mistral";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
-console.log("[DEBUG] AI SDK imports finished at:", new Date().toISOString());
 
 import * as dotenv from "dotenv";
 import { watch } from "chokidar";
@@ -25,9 +21,7 @@ import lodash from "lodash";
 import { z } from "zod";
 const { debounce } = lodash;
 
-console.log("[DEBUG] Before dotenv.config() at:", new Date().toISOString());
 dotenv.config();
-console.log("[DEBUG] After dotenv.config() at:", new Date().toISOString());
 
 app.commandLine.appendSwitch("enable-unsafe-webgpu");
 app.commandLine.appendSwitch("enable-features", "Vulkan,UseSkiaRenderer");
@@ -82,6 +76,7 @@ let isStartupComplete = false;
 
 let appState: AppState = { projects: [], activeProjectId: null };
 let encryptedApiKeys: Record<string, string> = {};
+let lastUsedModelConfig: ModelConfig | null = null;
 
 const storagePath = path.join(app.getPath("userData"), "storage.json");
 const keysPath = path.join(app.getPath("userData"), "keys.bin");
@@ -141,7 +136,7 @@ const projectStore = new LibSQLVector({
 });
 
 const globalStore = new LibSQLVector({
-  id: "global-store",
+  id: "construct-projects",
   url: `file:${globalDbPath}`,
 });
 
@@ -193,59 +188,104 @@ const agentMemory = new Memory({
 
 // --- Tools ---
 
-const search_project = createVectorQueryTool({
-  vectorStoreName: "project-store",
-  indexName: "project_content",
-  model: embeddingModel,
+const search_project = {
   id: "search_project",
   description:
     "Search the current project for specific logic, layouts, or event sheets. Use this whenever you need details about how the user's project is structured.",
-  reranker: {
-    model: createMistral({ apiKey: process.env.MISTRAL_API_KEY || "" })(
-      "mistral-large-latest",
-    ) as any,
-    options: {
-      weights: { semantic: 0.5, vector: 0.3, position: 0.2 },
-      topK: 5,
-    },
-  },
-});
+  inputSchema: z.object({
+    queryText: z.string().describe("The search query."),
+  }),
+  execute: async ({ queryText }: { queryText: string }) => {
+    try {
+      const { embeddings } = await embeddingModel.doEmbed({ values: [queryText] });
+      const queryVector = embeddings[0];
 
-const search_manual = createVectorQueryTool({
-  vectorStoreName: "global-store",
-  indexName: "manual_content",
-  model: embeddingModel,
+      const results = await projectStore.query({
+        indexName: "project_content",
+        queryVector,
+        topK: 5,
+      });
+
+      if (results.length === 0) return "No relevant project context found.";
+
+      return results
+        .map(
+          (r: any, i: number) =>
+            `--- Result ${i + 1} (${r.metadata?.path}) ---\n${r.metadata?.text}`,
+        )
+        .join("\n\n");
+    } catch (e: any) {
+      console.error("[DEBUG] Error in search_project tool:", e.message);
+      return `Error searching project: ${e.message}`;
+    }
+  },
+};
+
+const search_manual = {
   id: "search_manual",
   description:
     "Search the official Construct 3 manual for engine rules, behavior details, or syntax. Use this to verify how Construct 3 features work.",
-  reranker: {
-    model: createMistral({ apiKey: process.env.MISTRAL_API_KEY || "" })(
-      "mistral-large-latest",
-    ) as any,
-    options: {
-      weights: { semantic: 0.5, vector: 0.3, position: 0.2 },
-      topK: 5,
-    },
-  },
-});
+  inputSchema: z.object({
+    queryText: z.string().describe("The search query."),
+  }),
+  execute: async ({ queryText }: { queryText: string }) => {
+    try {
+      const { embeddings } = await embeddingModel.doEmbed({ values: [queryText] });
+      const queryVector = embeddings[0];
 
-const search_snippets = createVectorQueryTool({
-  vectorStoreName: "global-store",
-  indexName: "snippet_content",
-  model: embeddingModel,
+      const results = await globalStore.query({
+        indexName: "manual_content",
+        queryVector,
+        topK: 5,
+      });
+
+      if (results.length === 0) return "No relevant manual entries found.";
+
+      return results
+        .map(
+          (r: any, i: number) =>
+            `--- Manual Section: ${r.metadata?.title} ---\nSource: ${r.metadata?.url}\n\n${r.metadata?.text}`,
+        )
+        .join("\n\n");
+    } catch (e: any) {
+      console.error("[DEBUG] Error in search_manual tool:", e.message);
+      return `Error searching manual: ${e.message}`;
+    }
+  },
+};
+
+const search_snippets = {
   id: "search_snippets",
   description:
     "Search for gold-standard Construct 3 event JSON snippets. Use this to find correct JSON structures to show to the user or when generating logic.",
-  reranker: {
-    model: createMistral({ apiKey: process.env.MISTRAL_API_KEY || "" })(
-      "mistral-large-latest",
-    ) as any,
-    options: {
-      weights: { semantic: 0.5, vector: 0.3, position: 0.2 },
-      topK: 5,
-    },
+  inputSchema: z.object({
+    queryText: z.string().describe("The search query."),
+  }),
+  execute: async ({ queryText }: { queryText: string }) => {
+    try {
+      const { embeddings } = await embeddingModel.doEmbed({ values: [queryText] });
+      const queryVector = embeddings[0];
+
+      const results = await globalStore.query({
+        indexName: "snippet_content",
+        queryVector,
+        topK: 5,
+      });
+
+      if (results.length === 0) return "No relevant snippets found.";
+
+      return results
+        .map(
+          (r: any, i: number) =>
+            `--- Snippet ${i + 1} (${r.metadata?.path}) ---\n${r.metadata?.text}`,
+        )
+        .join("\n\n");
+    } catch (e: any) {
+      console.error("[DEBUG] Error in search_snippets tool:", e.message);
+      return `Error searching snippets: ${e.message}`;
+    }
   },
-});
+};
 
 const C3ClipboardSchema = z.object({
   "is-c3-clipboard-data": z.literal(true),
@@ -277,13 +317,54 @@ const generate_c3_clipboard = {
   inputSchema: z.object({
     logic: z.string().describe("The logical flow to generate."),
     objects: z.array(z.string()).describe("List of object names to use."),
+    contextSnippets: z
+      .string()
+      .optional()
+      .describe("Optional snippet templates to use as reference."),
   }),
-  execute: async ({ logic, objects }: { logic: string; objects: string[] }) => {
-    const result = await generator.generate(
-      `Generate Construct 3 clipboard JSON for: ${logic}. Use objects: ${objects.join(", ")}.`,
-      { structuredOutput: { schema: C3ClipboardSchema } },
-    );
-    return JSON.stringify(result.object);
+  execute: async ({
+    logic,
+    objects,
+    contextSnippets,
+  }: {
+    logic: string;
+    objects: string[];
+    contextSnippets?: string;
+  }) => {
+    try {
+      const config = lastUsedModelConfig || { provider: "mistral" };
+      const model = getDynamicModel(config);
+
+      const prompt = `You are a Construct 3 JSON generator.
+Convert the following logic into a valid Construct 3 clipboard JSON object.
+
+### LOGIC TO CONVERT:
+${logic}
+
+### OBJECTS TO USE:
+${objects.join(", ")}
+
+${contextSnippets ? `### REFERENCE SNIPPETS:\n${contextSnippets}` : ""}
+
+Output ONLY the JSON object following the schema.`;
+
+      // Use the base generator agent but WITHOUT tools to prevent recursion
+      const simpleGenerator = new Agent({
+        id: "simple-generator",
+        name: "Generator",
+        instructions: "You generate Construct 3 JSON. No tools allowed.",
+        model,
+      });
+
+      const result = await simpleGenerator.generate(prompt, {
+        structuredOutput: { schema: C3ClipboardSchema },
+      });
+
+      return JSON.stringify(result.object);
+    } catch (e: any) {
+      console.error("[DEBUG] Error in generate_c3_clipboard tool:", e.message);
+      return `Error generating clipboard JSON: ${e.message}`;
+    }
   },
 };
 
@@ -383,7 +464,6 @@ const get_project_summary = {
       return "No project loaded. Please ask the user to select a project folder.";
     try {
       const projFilePath = path.join(currentProjectPath, "project.c3proj");
-      console.log("[DEBUG] Reading project file at:", projFilePath);
       const data = JSON.parse(await fs.readFile(projFilePath, "utf8"));
 
       const extractItems = (node: any): string[] => {
@@ -402,7 +482,6 @@ const get_project_summary = {
       const eventSheets = extractItems(data.eventSheets);
 
       const summary = `Project Name: ${data.name || "Untitled"}\nLayouts: ${layouts.join(", ") || "None"}\nEvent Sheets: ${eventSheets.join(", ") || "None"}`;
-      console.log("[DEBUG] Tool get_project_summary returning:", summary);
       return summary;
     } catch (e: any) {
       console.error("[DEBUG] Tool get_project_summary failed:", e.message);
@@ -420,42 +499,56 @@ const audit_project = {
   },
 };
 
+const record_thought = {
+  id: "record_thought",
+  description:
+    "Record your internal reasoning, plan, or progress. Use this to keep the user informed during complex multi-step tasks.",
+  inputSchema: z.object({
+    thought: z.string().describe("Your internal reasoning or plan."),
+  }),
+  execute: async ({ thought }: { thought: string }) => {
+    return "Thought recorded.";
+  },
+};
+
 // --- Agents ---
 
 const AGENT_CONFIGS: Record<string, any> = {
   "architect-agent": {
     name: "Architect",
     instructions:
-      "You are a Construct 3 Architect. Use tools to research the project structure, layouts, and families. Always gather current project context before answering.",
+      "You are a Construct 3 Architect. Use tools to research the project structure, layouts, and families. Always gather current project context before answering.\n\nREASONING RULE: Before using any tool or giving a final answer, you MUST use the 'record_thought' tool to document your plan and reasoning. Think step-by-step about what you need to know and how you will find it.",
     tools: {
       search_project,
       list_project_files,
       list_project_addons,
       get_project_summary,
+      record_thought,
     },
   },
   "logic-expert-agent": {
     name: "Logic Expert",
     instructions:
-      "You are a Construct 3 Logic Expert. Use tools to research event sheets, engine rules, and manual documentation before answering.",
+      "You are a Construct 3 Logic Expert. Use tools to research event sheets, engine rules, and manual documentation before answering.\n\nREASONING RULE: Before using any tool or giving a final answer, you MUST use the 'record_thought' tool to document your reasoning. Think step-by-step about how Construct 3 logic works and what documentation you need to verify.",
     tools: {
       search_events,
       search_manual,
       audit_project,
       get_object_schema,
       get_project_summary,
+      record_thought,
     },
   },
   "generator-agent": {
     name: "Generator",
     instructions:
-      "You are a Construct 3 Code/Logic Generator. Use tools to search snippets and generate valid C3 clipboard JSON. Always output valid JSON blocks for clipboard use.",
-    tools: { search_snippets },
+      "You are a Construct 3 Code/Logic Generator. Use tools to search snippets and generate valid C3 clipboard JSON. Always output valid JSON blocks. Use the snippets found via 'search_snippets' as templates for the correct JSON structure.\n\nREASONING RULE: Before generating the JSON, you MUST use the 'record_thought' tool to document your plan. Explain which conditions and actions are needed and how they map to Construct 3's engine.",
+    tools: { search_snippets, record_thought },
   },
   "construct-llm-agent": {
     name: "Construct 3 Expert",
     instructions:
-      "You are a General Construct 3 Expert. Use all provided tools to research project context, search the manual, and gather any information needed to provide accurate, project-specific help.",
+      "You are a General Construct 3 Expert. Use all provided tools to research project context, search the manual, and gather any information needed to provide accurate, project-specific help.\n\nREASONING RULE: Before using any tool or giving a final answer, you MUST use the 'record_thought' tool to document your reasoning. Think step-by-step about the user's problem and your research strategy.\n\nIMPORTANT: If the user asks for Construct 3 event logic, JSON, or code, you MUST FIRST use 'search_snippets' to gather context, and THEN use the 'generate_c3_clipboard' tool. You MUST pass the snippets found into the 'contextSnippets' parameter of the generator tool. Do not call these tools in parallel; work sequentially.",
     tools: {
       search_project,
       search_manual,
@@ -467,6 +560,7 @@ const AGENT_CONFIGS: Record<string, any> = {
       search_events,
       audit_project,
       get_project_summary,
+      record_thought,
     },
   },
 };
@@ -546,10 +640,8 @@ const createDynamicAgent = (
   agentId = "construct-llm-agent",
   customPrompt?: string,
 ) => {
-  console.log("[DEBUG] createDynamicAgent called for:", agentId);
   const config = AGENT_CONFIGS[agentId];
   if (!config) {
-    console.error("[DEBUG] FATAL: Agent not found in AGENT_CONFIGS:", agentId);
     throw new Error(`Agent not found: ${agentId}`);
   }
 
@@ -558,8 +650,6 @@ const createDynamicAgent = (
   if (customPrompt) {
     finalInstructions += `\n\n### USER CUSTOM INSTRUCTIONS:\n${customPrompt}\n`;
   }
-
-  console.log("[DEBUG] Final instructions for dynamic agent:", finalInstructions);
 
   return new Agent({
     id: agentId,
@@ -595,14 +685,32 @@ async function getAllFiles(dirPath: string, arrayOfFiles: string[] = []) {
   return arrayOfFiles;
 }
 
+let indexCache: Record<string, number> = {};
+const indexCachePath = path.join(app.getPath("userData"), "index-cache.json");
+
+async function loadIndexCache() {
+  try {
+    const data = await fs.readFile(indexCachePath, "utf8");
+    indexCache = JSON.parse(data);
+  } catch (e) {
+    indexCache = {};
+  }
+}
+
+async function saveIndexCache() {
+  try {
+    await fs.writeFile(indexCachePath, JSON.stringify(indexCache, null, 2));
+  } catch (e) {
+    console.error("Failed to save index cache:", e);
+  }
+}
+
 async function syncProjectToVectorStore(projectPath: string, force = false) {
-  console.log(`[DEBUG] syncProjectToVectorStore: path=${projectPath}, force=${force}`);
   try {
     await projectStore.createIndex({
       indexName: "project_content",
       dimension: 384,
     });
-    console.log("[DEBUG] Created or verified project_content index.");
   } catch (e) {
     // Index might already exist
   }
@@ -615,14 +723,24 @@ async function syncProjectToVectorStore(projectPath: string, force = false) {
   }
 
   try {
+    await loadIndexCache();
     const allFiles = await getAllFiles(projectPath);
-    console.log(`[DEBUG] Found ${allFiles.length} files to index.`);
 
     let filesProcessed = 0;
+    let filesActuallyIndexed = 0;
     for (const filePath of allFiles) {
       filesProcessed++;
       try {
+        const stat = await fs.stat(filePath);
+        const mtimeMs = stat.mtimeMs;
         const relativePath = path.relative(projectPath, filePath);
+
+        // Skip file if it hasn't been modified since last index (unless forced)
+        if (!force && indexCache[filePath] === mtimeMs) {
+          continue;
+        }
+
+        filesActuallyIndexed++;
 
         // Update UI with progress
         if (mainWindow) {
@@ -635,7 +753,10 @@ async function syncProjectToVectorStore(projectPath: string, force = false) {
         }
 
         const content = await fs.readFile(filePath, "utf8");
-        if (!content || content.trim().length === 0) continue;
+        if (!content || content.trim().length === 0) {
+          indexCache[filePath] = mtimeMs;
+          continue;
+        }
 
         const doc = MDocument.fromText(content, {
           metadata: {
@@ -649,8 +770,6 @@ async function syncProjectToVectorStore(projectPath: string, force = false) {
           maxSize: 1000,
           overlap: 200,
         });
-
-        console.log(`[DEBUG] Indexing ${relativePath} (${chunks.length} chunks)`);
 
         // Increased batch size since the worker handles it without blocking the main thread
         const batchSize = 50;
@@ -693,14 +812,18 @@ async function syncProjectToVectorStore(projectPath: string, force = false) {
           // Minimal yield to process incoming IPC messages
           await sleep(5);
         }
+
+        // Successfully indexed, update cache
+        indexCache[filePath] = mtimeMs;
       } catch (err: any) {
-        console.error(`[DEBUG] Failed to index file ${filePath}:`, err.message);
+        console.error(`Failed to index file ${filePath}:`, err.message);
       }
       // Minimal yield between files
       await sleep(10);
     }
 
-    console.log("[DEBUG] Project indexing complete.");
+    await saveIndexCache();
+
     if (mainWindow) {
       mainWindow.webContents.send("indexing-status", {
         status: "complete",
@@ -708,7 +831,7 @@ async function syncProjectToVectorStore(projectPath: string, force = false) {
       });
     }
   } catch (error: any) {
-    console.error("[DEBUG] Error in syncProjectToVectorStore:", error.message);
+    console.error("Error in syncProjectToVectorStore:", error.message);
     if (mainWindow) {
       mainWindow.webContents.send("indexing-status", {
         status: "error",
@@ -750,24 +873,31 @@ const createWindow = () => {
 };
 
 app.on("ready", async () => {
-  console.log("[DEBUG] App ready event fired at:", new Date().toISOString());
+  // Quick check if global DB exists and has rows
+  // (We use a simple non-zero vector to avoid division by zero in cosine similarity)
+  try {
+    const dummyVector = new Array(384).fill(0.1);
+    const manualResults = await globalStore.query({
+      indexName: "manual_content",
+      queryVector: dummyVector,
+      topK: 1,
+    });
+  } catch (e: any) {
+    console.warn(`Initial manual DB check failed: ${e.message}`);
+  }
+
   await loadState();
-  console.log("[DEBUG] App state loaded at:", new Date().toISOString());
   createWindow();
-  console.log("[DEBUG] Window created at:", new Date().toISOString());
   await sleep(500);
-  console.log("[DEBUG] Ready to sync projects.");
   if (appState.activeProjectId) {
     const p = appState.projects.find((p) => p.id === appState.activeProjectId);
     if (p) {
       await syncProjectToVectorStore(p.path);
-      console.log("[DEBUG] Initial project synced at:", new Date().toISOString());
     }
   }
   isStartupComplete = true;
   if (mainWindow) {
     mainWindow.webContents.send("startup-complete");
-    console.log("[DEBUG] startup-complete sent at:", new Date().toISOString());
   }
 });
 
@@ -894,30 +1024,29 @@ ipcMain.handle(
       agentId,
     }: { text: string; threadId: string; modelConfig?: any; agentId?: string },
   ) => {
-    console.log("[DEBUG] ask-question called with:", { threadId, agentId });
     try {
       const p = appState.projects.find((pr) => pr.id === appState.activeProjectId);
       if (!p) {
-        console.log("[DEBUG] No project found for activeProjectId:", appState.activeProjectId);
         return "No project.";
       }
       // Ensure sync
       currentProjectPath = p.path;
 
       const targetAgentId = agentId && agentId !== "auto" ? agentId : "construct-llm-agent";
-      console.log("[DEBUG] Using agent:", targetAgentId);
 
-      const activeAgent = createDynamicAgent(
-        { ...modelConfig, apiKey: encryptedApiKeys[modelConfig?.provider] },
-        targetAgentId,
-        p.customPrompt,
-      );
+      // Store the model config for tool use
+      const currentModelConfig = {
+        ...modelConfig,
+        apiKey: encryptedApiKeys[modelConfig?.provider],
+      };
+      lastUsedModelConfig = currentModelConfig;
 
-      console.log("[DEBUG] Starting stream for prompt:", text.substring(0, 50) + "...");
+      const activeAgent = createDynamicAgent(currentModelConfig, targetAgentId, p.customPrompt);
 
       const result = await activeAgent.stream(text, {
         threadId,
         resourceId: p.path,
+        maxSteps: 10,
         // Ensure memory context is correctly passed down if the version requires it
         memory: {
           thread: {
@@ -928,7 +1057,6 @@ ipcMain.handle(
       });
 
       if (!result.fullStream) {
-        console.log("[DEBUG] No fullStream returned from activeAgent.stream");
         throw new Error("No stream");
       }
 
@@ -936,38 +1064,51 @@ ipcMain.handle(
       while (true) {
         const { done, value: chunk } = await reader.read();
         if (done) {
-          console.log("[DEBUG] Stream done");
           break;
         }
+
         if (chunk.type === "tool-call") {
-          console.log("[DEBUG] Tool call detected:", chunk.payload?.toolName, chunk.payload?.args);
           if (mainWindow)
             mainWindow.webContents.send("agent-reflection", {
               type: "tool-call",
               toolName: chunk.payload?.toolName,
               args: chunk.payload?.args,
+              toolCallId: chunk.payload?.toolCallId,
             });
         } else if (chunk.type === "tool-result") {
-          console.log(
-            "[DEBUG] Tool result detected:",
-            chunk.payload?.toolName,
-            chunk.payload?.result,
-          );
           if (mainWindow)
             mainWindow.webContents.send("agent-reflection", {
               type: "tool-result",
               toolName: chunk.payload?.toolName,
               result: chunk.payload?.result,
+              toolCallId: chunk.payload?.toolCallId,
             });
         } else if (chunk.type === "thought") {
-          console.log("[DEBUG] Thought detected:", chunk.payload?.content);
           if (mainWindow)
             mainWindow.webContents.send("agent-reflection", {
               type: "thought",
               content: chunk.payload?.content,
             });
         } else if (chunk.type === "text-delta") {
-          if (mainWindow) mainWindow.webContents.send("agent-chunk", chunk.payload?.text || "");
+          const text = chunk.payload?.textDelta || chunk.payload?.text || "";
+          if (mainWindow) mainWindow.webContents.send("agent-chunk", text);
+        } else if (chunk.type === "tool-call-delta") {
+          if (mainWindow)
+            mainWindow.webContents.send("agent-reflection", {
+              type: "tool-call-delta",
+              toolName: chunk.payload?.toolName,
+              argsTextDelta: chunk.payload?.argsTextDelta,
+              toolCallId: chunk.payload?.toolCallId,
+            });
+        } else if (chunk.type === "step-start") {
+          if (mainWindow)
+            mainWindow.webContents.send("agent-reflection", {
+              type: "thought",
+              content: "Agent is starting a new reasoning step...",
+              transient: true,
+            });
+        } else if (chunk.type === "error") {
+          console.error("[DEBUG] Agent error chunk:", chunk.payload);
         }
       }
       return "Done";

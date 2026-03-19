@@ -58,9 +58,3 @@
 
 - Problem: A single agent might produce logic that is technically valid but inefficient.
 - Action: Implement a "Reviewer" agent that automatically runs the `audit_project` logic on the AI's own suggestions before they are presented to the user.
-
-## 12. Project-wide Lint & TypeScript Fixes (DONE)
-
-- Migrated to `oxlint` and `oxfmt` for ultra-fast linting and formatting.
-- Fixed existing linting issues using `oxlint --fix`.
-- Integrated formatting into the development workflow via `GEMINI.md`.

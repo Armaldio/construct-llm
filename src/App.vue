@@ -30,8 +30,11 @@ interface Reflection {
   content: string;
   type: ReflectionType;
   toolName?: string;
+  toolCallId?: string;
   args?: any;
+  argsText?: string;
   result?: any;
+  transient?: boolean;
 }
 
 interface ChatMessagePart {
@@ -246,24 +249,35 @@ const models = [
 ];
 
 const isUserScrolling = ref(false);
+let isProgrammaticScroll = false;
 
 const handleScroll = (e: Event) => {
+  if (isProgrammaticScroll) {
+    isProgrammaticScroll = false;
+    return;
+  }
   const el = e.target as HTMLElement;
   if (!el) return;
-  // Calculate how far we are from the bottom
   const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-  // If we are more than 50px away from the bottom, assume the user is reading history
-  isUserScrolling.value = distanceToBottom > 50;
+  // If user is more than 20px from bottom, they are "scrolling up"
+  isUserScrolling.value = distanceToBottom > 20;
 };
 
 const scrollToBottom = (force = false) => {
-  nextTick(() => {
-    if (messagesContainer.value) {
-      if (force || !isUserScrolling.value) {
-        messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight;
-      }
+  if (messagesContainer.value) {
+    const el = messagesContainer.value;
+    // Only scroll if forced OR if we are currently at the bottom
+    // We check this BEFORE nextTick to see the state before the new content is rendered
+    const wasAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 50;
+
+    if (force || wasAtBottom) {
+      nextTick(() => {
+        isProgrammaticScroll = true;
+        el.scrollTop = el.scrollHeight;
+        isUserScrolling.value = false;
+      });
     }
-  });
+  }
 };
 onMounted(async () => {
   // Listen for startup progress
@@ -336,6 +350,16 @@ onMounted(async () => {
         if (!lastMsg.parts) lastMsg.parts = [];
         if (!lastMsg.reflections) lastMsg.reflections = [];
 
+        // Deep cleanup of all transient reflections across all parts if we receive non-transient info
+        if (!data.transient) {
+          lastMsg.parts.forEach((p) => {
+            if (p.type === "reflection" && p.reflections) {
+              p.reflections = p.reflections.filter((r) => !r.transient);
+            }
+          });
+          lastMsg.reflections = lastMsg.reflections.filter((r) => !r.transient);
+        }
+
         // Check if last part is a reflection part, or create one
         let lastPart = lastMsg.parts[lastMsg.parts.length - 1];
         if (!lastPart || lastPart.type !== "reflection") {
@@ -350,28 +374,97 @@ onMounted(async () => {
             id: Date.now(),
             content: data.content,
             type: "info",
+            transient: data.transient,
           };
           reflections.push(reflection);
           lastMsg.reflections.push(reflection);
+        } else if (data.type === "tool-call-delta") {
+          // Find if we already have this tool call in the current reflection part
+          let existing = reflections.find(
+            (r) =>
+              r.type === "tool" &&
+              ((data.toolCallId && r.toolCallId === data.toolCallId) ||
+                (!data.toolCallId && r.toolName === data.toolName && !r.result)),
+          );
+          const isRecordThought = data.toolName === "record_thought";
+
+          if (existing) {
+            if (!existing.argsText) existing.argsText = "";
+            existing.argsText += data.argsTextDelta || "";
+
+            if (isRecordThought) {
+              try {
+                // Try to extract the thought string from partial JSON
+                const match = existing.argsText.match(/"thought"\s*:\s*"((?:[^"\\]|\\.)*)"?/);
+                if (match && match[1]) {
+                  const cleanText = match[1]
+                    .replace(/\\n/g, "\n")
+                    .replace(/\\"/g, '"')
+                    .replace(/\\t/g, "\t");
+                  existing.content = `Reasoning: ${cleanText}`;
+                } else {
+                  existing.content = `Reasoning: ${existing.argsText}`;
+                }
+              } catch (e) {
+                existing.content = `Reasoning: ${existing.argsText}`;
+              }
+            } else {
+              existing.content = `Preparing tool: ${data.toolName}... (args: ${existing.argsText})`;
+            }
+          } else {
+            const reflection: Reflection = {
+              id: Date.now(),
+              content: isRecordThought ? "Reasoning: ..." : `Preparing tool: ${data.toolName}...`,
+              type: "tool",
+              toolName: data.toolName,
+              toolCallId: data.toolCallId,
+              argsText: data.argsTextDelta || "",
+            };
+            reflections.push(reflection);
+            lastMsg.reflections.push(reflection);
+          }
         } else if (data.type === "tool-call") {
-          const reflection: Reflection = {
-            id: Date.now(),
-            content: `Using tool: ${data.toolName}...`,
-            type: "tool",
-            toolName: data.toolName,
-            args: data.args,
-          };
-          reflections.push(reflection);
-          lastMsg.reflections.push(reflection);
+          // Finalize or create tool call
+          let existing = reflections.find(
+            (r) =>
+              r.type === "tool" &&
+              ((data.toolCallId && r.toolCallId === data.toolCallId) ||
+                (!data.toolCallId && r.toolName === data.toolName && !r.result)),
+          );
+
+          const isRecordThought = data.toolName === "record_thought";
+          const content = isRecordThought
+            ? `Reasoning: ${data.args?.thought || "..."}`
+            : `Using tool: ${data.toolName}...`;
+
+          if (existing) {
+            existing.content = content;
+            existing.args = data.args;
+            if (data.toolCallId) existing.toolCallId = data.toolCallId;
+          } else {
+            const reflection: Reflection = {
+              id: Date.now(),
+              content: content,
+              type: "tool",
+              toolName: data.toolName,
+              toolCallId: data.toolCallId,
+              args: data.args,
+            };
+            reflections.push(reflection);
+            lastMsg.reflections.push(reflection);
+          }
         } else if (data.type === "tool-result") {
           // Find the last tool-call reflection in ANY reflection part
           let found = false;
           for (let i = lastMsg.parts.length - 1; i >= 0; i--) {
             const part = lastMsg.parts[i];
             if (part.type === "reflection" && part.reflections) {
-              const lastToolCall = [...part.reflections]
-                .reverse()
-                .find((r) => r.type === "tool" && r.toolName === data.toolName && !r.result);
+              const lastToolCall = [...part.reflections].reverse().find(
+                (r) =>
+                  r.type === "tool" &&
+                  ((data.toolCallId && r.toolCallId === data.toolCallId) ||
+                    (!data.toolCallId && r.toolName === data.toolName && !r.result)),
+              );
 
               if (lastToolCall) {
                 lastToolCall.result = data.result;
@@ -387,15 +480,19 @@ onMounted(async () => {
               content: `Tool result: ${data.toolName}`,
               type: "result",
               toolName: data.toolName,
+              toolCallId: data.toolCallId,
               result: data.result,
             };
             reflections.push(reflection);
             lastMsg.reflections.push(reflection);
           }
           // Also update the legacy reflections array
-          const legacyToolCall = [...lastMsg.reflections]
-            .reverse()
-            .find((r) => r.type === "tool" && r.toolName === data.toolName && !r.result);
+          const legacyToolCall = [...lastMsg.reflections].reverse().find(
+            (r) =>
+              r.type === "tool" &&
+              ((data.toolCallId && r.toolCallId === data.toolCallId) ||
+                (!data.toolCallId && r.toolName === data.toolName && !r.result)),
+          );
           if (legacyToolCall) legacyToolCall.result = data.result;
         }
         scrollToBottom();
@@ -409,6 +506,16 @@ onMounted(async () => {
       const lastMsg = messages[messages.length - 1];
       if (lastMsg && lastMsg.role === "assistant") {
         if (!lastMsg.parts) lastMsg.parts = [];
+
+        // Remove any transient placeholders when real text arrives
+        lastMsg.parts.forEach((p) => {
+          if (p.type === "reflection" && p.reflections) {
+            p.reflections = p.reflections.filter((r) => !r.transient);
+          }
+        });
+        if (lastMsg.reflections) {
+          lastMsg.reflections = lastMsg.reflections.filter((r) => !r.transient);
+        }
 
         let lastPart = lastMsg.parts[lastMsg.parts.length - 1];
         if (!lastPart || lastPart.type !== "text") {
@@ -1433,28 +1540,29 @@ const copyToClipboard = (text: string) => {
 }
 
 .message {
-  max-width: 85%;
+  max-width: 95%;
   min-width: 0;
 }
 
 .message.user {
   align-self: flex-end;
+  max-width: 85%;
 }
 
 .message.assistant {
   align-self: flex-start;
+  width: 100%;
 }
 
 /* Research Log */
 .research-log {
-  align-self: flex-start;
+  align-self: stretch;
   margin-top: 0.5rem;
   margin-bottom: 1rem;
   background: #f1f5f9;
   border: 1px solid #e2e8f0;
   border-radius: 8px;
   width: 100%;
-  max-width: 400px;
   overflow: hidden;
 }
 
