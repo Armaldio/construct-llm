@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed } from "vue";
 
 const props = defineProps<{
   data: any;
@@ -7,37 +7,46 @@ const props = defineProps<{
 
 // Helper to turn technical IDs into readable C3 names
 const formatId = (id: string) => {
-  if (!id) return '';
+  if (!id) return "";
   // Specific overrides for common C3 actions
   const overrides: Record<string, string> = {
-    'on-start-of-layout': 'On start of layout',
-    'compare-instance-variable': 'Compare instance variable',
-    'set-instvar-value': 'Set value',
-    'add-to-instvar-value': 'Add to',
-    'set-boolean-instvar': 'Set boolean',
-    'simulate-control': 'Simulate control',
-    'on-collision-with-another-object': 'On collision with',
-    'is-overlapping-another-object': 'Is overlapping',
-    'wait-for-previous-actions': 'Wait for previous actions to complete',
-    'trigger-once-while-true': 'Trigger once while true',
-    'pick-by-unique-id': 'Pick by UID',
-    'set-group-active': 'Set group active',
+    "on-start-of-layout": "On start of layout",
+    "compare-instance-variable": "Compare instance variable",
+    "set-instvar-value": "Set value",
+    "add-to-instvar-value": "Add to",
+    "set-boolean-instvar": "Set boolean",
+    "simulate-control": "Simulate control",
+    "on-collision-with-another-object": "On collision with",
+    "is-overlapping-another-object": "Is overlapping",
+    "wait-for-previous-actions": "Wait for previous actions to complete",
+    "trigger-once-while-true": "Trigger once while true",
+    "pick-by-unique-id": "Pick by UID",
+    "set-group-active": "Set group active",
   };
 
   if (overrides[id]) return overrides[id];
 
   // Fallback: kebab-case to Title case
-  return id.split('-').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ');
+  return id
+    .split("-")
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
 };
 
 const formatParams = (params: any) => {
-  if (!params) return '';
+  if (!params) return "";
   const entries = Object.entries(params);
-  if (entries.length === 0) return '';
-  
-  return '(' + entries.map(([key, value]) => {
-    return `${JSON.stringify(value)}`;
-  }).join(', ') + ')';
+  if (entries.length === 0) return "";
+
+  return (
+    "(" +
+    entries
+      .map(([key, value]) => {
+        return `${JSON.stringify(value)}`;
+      })
+      .join(", ") +
+    ")"
+  );
 };
 
 const items = computed(() => {
@@ -50,7 +59,6 @@ const items = computed(() => {
 <template>
   <div class="c3-event-sheet">
     <template v-for="(item, index) in items" :key="index">
-      
       <!-- Event Block -->
       <div v-if="item.eventType === 'block'" class="c3-block">
         <div class="c3-event-row">
@@ -62,12 +70,14 @@ const items = computed(() => {
               <span class="c3-params">{{ formatParams(cond.parameters) }}</span>
             </div>
           </div>
-          
+
           <!-- Actions Column -->
           <div class="c3-actions">
             <div v-for="(act, aIdx) in item.actions" :key="aIdx" class="c3-action">
               <span class="c3-object">{{ act.objectClass }}</span>
-              <span class="c3-id">{{ act.callFunction ? `Call ${act.callFunction}` : formatId(act.id) }}</span>
+              <span class="c3-id">{{
+                act.callFunction ? `Call ${act.callFunction}` : formatId(act.id)
+              }}</span>
               <span class="c3-params">{{ formatParams(act.parameters) }}</span>
             </div>
             <div v-if="!item.actions || item.actions.length === 0" class="c3-no-actions">
@@ -94,17 +104,14 @@ const items = computed(() => {
       </div>
 
       <!-- Comment -->
-      <div v-else-if="item.eventType === 'comment'" class="c3-comment">
-        // {{ item.text }}
-      </div>
-
+      <div v-else-if="item.eventType === 'comment'" class="c3-comment">// {{ item.text }}</div>
     </template>
   </div>
 </template>
 
 <style scoped>
 .c3-event-sheet {
-  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
   font-size: 12px;
   background: white;
   color: #333;
@@ -141,7 +148,8 @@ const items = computed(() => {
   justify-content: center;
 }
 
-.c3-condition, .c3-action {
+.c3-condition,
+.c3-action {
   margin: 2px 0;
   line-height: 1.4;
 }

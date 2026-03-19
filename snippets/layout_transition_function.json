@@ -4,12 +4,8 @@
   "items": [
     {
       "eventType": "block",
-      "conditions": [
-        { "id": "on-start-of-layout", "objectClass": "System" }
-      ],
-      "actions": [
-        { "callFunction": "Transition", "parameters": ["\"In\"", "\"\""] }
-      ]
+      "conditions": [{ "id": "on-start-of-layout", "objectClass": "System" }],
+      "actions": [{ "callFunction": "Transition", "parameters": ["\"In\"", "\"\""] }]
     }
   ]
 }

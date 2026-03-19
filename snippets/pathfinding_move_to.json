@@ -4,9 +4,7 @@
   "items": [
     {
       "eventType": "block",
-      "conditions": [
-        { "id": "every-tick", "objectClass": "System" }
-      ],
+      "conditions": [{ "id": "every-tick", "objectClass": "System" }],
       "actions": [
         {
           "id": "find-path",

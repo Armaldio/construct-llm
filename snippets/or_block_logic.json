@@ -6,11 +6,13 @@
       "eventType": "block",
       "conditions": [
         { "id": "on-key-pressed", "objectClass": "Keyboard", "parameters": { "key": 32 } },
-        { "id": "on-button-pressed", "objectClass": "Gamepad", "parameters": { "gamepad": "0", "button": "button-a" } }
+        {
+          "id": "on-button-pressed",
+          "objectClass": "Gamepad",
+          "parameters": { "gamepad": "0", "button": "button-a" }
+        }
       ],
-      "actions": [
-        { "callFunction": "Jump" }
-      ],
+      "actions": [{ "callFunction": "Jump" }],
       "isOrBlock": true
     }
   ]

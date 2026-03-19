@@ -5,7 +5,11 @@
     {
       "eventType": "block",
       "conditions": [
-        { "id": "is-button-down", "objectClass": "Gamepad", "parameters": { "gamepad": "0", "button": "d-pad-up" } }
+        {
+          "id": "is-button-down",
+          "objectClass": "Gamepad",
+          "parameters": { "gamepad": "0", "button": "d-pad-up" }
+        }
       ],
       "actions": [
         {

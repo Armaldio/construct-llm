@@ -4,9 +4,7 @@
   "items": [
     {
       "eventType": "block",
-      "conditions": [
-        { "id": "on-item-collected", "objectClass": "Item" }
-      ],
+      "conditions": [{ "id": "on-item-collected", "objectClass": "Item" }],
       "actions": [
         {
           "id": "push",

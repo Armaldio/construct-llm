@@ -1,23 +1,251 @@
-import { app, BrowserWindow, ipcMain, dialog } from "electron";
+console.log("[DEBUG] Main process starting at:", new Date().toISOString());
+import { app, BrowserWindow, ipcMain, dialog, safeStorage } from "electron";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs/promises";
 import started from "electron-squirrel-startup";
+console.log("[DEBUG] Basic imports finished at:", new Date().toISOString());
+
 import { Mastra } from "@mastra/core";
 import { Agent } from "@mastra/core/agent";
 import { LibSQLVector, LibSQLStore } from "@mastra/libsql";
 import { Memory } from "@mastra/memory";
 import { MDocument, createVectorQueryTool } from "@mastra/rag";
-import { mistral } from "@ai-sdk/mistral";
-import { pipeline } from "@xenova/transformers";
+console.log("[DEBUG] Mastra imports finished at:", new Date().toISOString());
+
+import { createMistral } from "@ai-sdk/mistral";
+import { createOpenAI } from "@ai-sdk/openai";
+import { createAnthropic } from "@ai-sdk/anthropic";
+import { createGoogleGenerativeAI } from "@ai-sdk/google";
+console.log("[DEBUG] AI SDK imports finished at:", new Date().toISOString());
+
 import * as dotenv from "dotenv";
-import chokidar from "chokidar";
-import pkg from "lodash";
+import { watch } from "chokidar";
+import lodash from "lodash";
 import { z } from "zod";
-import { createRequire } from "node:module";
-const require = createRequire(import.meta.url);
-const { PDFParse } = require("pdf-parse");
-const { debounce } = pkg;
+const { debounce } = lodash;
+
+console.log("[DEBUG] Before dotenv.config() at:", new Date().toISOString());
+dotenv.config();
+console.log("[DEBUG] After dotenv.config() at:", new Date().toISOString());
+
+app.commandLine.appendSwitch("enable-unsafe-webgpu");
+app.commandLine.appendSwitch("enable-features", "Vulkan,UseSkiaRenderer");
+app.commandLine.appendSwitch("ignore-gpu-blocklist");
+
+// --- Interfaces ---
+
+interface ModelConfig {
+  provider: string;
+  modelId?: string;
+  apiKey?: string;
+}
+
+interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+interface ChatThread {
+  id: string;
+  name: string;
+  messages: ChatMessage[];
+  modelConfig: ModelConfig;
+}
+
+interface Project {
+  id: string;
+  name: string;
+  path: string;
+  threads: ChatThread[];
+  customPrompt?: string;
+}
+
+interface AppState {
+  projects: Project[];
+  activeProjectId: string | null;
+}
+
+// --- State ---
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+if (started) {
+  app.quit();
+}
+
+let mainWindow: BrowserWindow | null = null;
+let currentProjectPath: string | null = null;
+let projectWatcher: ReturnType<typeof watch> | null = null;
+let isStartupComplete = false;
+
+let appState: AppState = { projects: [], activeProjectId: null };
+let encryptedApiKeys: Record<string, string> = {};
+
+const storagePath = path.join(app.getPath("userData"), "storage.json");
+const keysPath = path.join(app.getPath("userData"), "keys.bin");
+const projectDbPath = path.join(app.getPath("userData"), "projects.db");
+const globalDbPath = app.isPackaged
+  ? path.join(process.resourcesPath, "prebuilt-assets.db")
+  : path.join(process.cwd(), "prebuilt-assets.db");
+
+// --- Persistence ---
+
+async function saveState() {
+  try {
+    const { ...stateToSave } = appState;
+    await fs.writeFile(storagePath, JSON.stringify(stateToSave, null, 2));
+  } catch (e) {
+    console.error("Failed to save state:", e);
+  }
+}
+
+async function loadState() {
+  try {
+    const data = await fs.readFile(storagePath, "utf8");
+    appState = JSON.parse(data);
+    if (appState.activeProjectId) {
+      const project = appState.projects.find((p) => p.id === appState.activeProjectId);
+      if (project) {
+        currentProjectPath = project.path;
+        startWatchingProject(project.path);
+      }
+    }
+  } catch (e) {
+    appState = { projects: [], activeProjectId: null };
+  }
+
+  try {
+    if (safeStorage.isEncryptionAvailable()) {
+      const buffer = await fs.readFile(keysPath);
+      encryptedApiKeys = JSON.parse(safeStorage.decryptString(buffer));
+    }
+  } catch (e) {
+    encryptedApiKeys = {};
+  }
+}
+
+async function saveKeys(keys: Record<string, string>) {
+  if (safeStorage.isEncryptionAvailable()) {
+    encryptedApiKeys = keys;
+    await fs.writeFile(keysPath, safeStorage.encryptString(JSON.stringify(keys)));
+  }
+}
+
+// --- Mastra Configuration ---
+
+const projectStore = new LibSQLVector({
+  id: "project-store",
+  url: `file:${projectDbPath}`,
+});
+
+const globalStore = new LibSQLVector({
+  id: "global-store",
+  url: `file:${globalDbPath}`,
+});
+
+const memoryStore = new LibSQLStore({
+  id: "construct-memory",
+  url: `file:${path.join(app.getPath("userData"), "construct-memory.db")}`,
+});
+
+let embeddingRequestId = 0;
+const pendingEmbeddings = new Map<
+  number,
+  { resolve: (val: any) => void; reject: (err: any) => void }
+>();
+
+ipcMain.on("embedding-result", (event, { id, embeddings, error }) => {
+  const promiseHandlers = pendingEmbeddings.get(id);
+  if (promiseHandlers) {
+    if (error) {
+      promiseHandlers.reject(new Error(error));
+    } else {
+      promiseHandlers.resolve({ embeddings });
+    }
+    pendingEmbeddings.delete(id);
+  }
+});
+
+const embeddingModel = {
+  specificationVersion: "v1",
+  provider: "webgpu",
+  modelId: "Xenova/all-MiniLM-L6-v2",
+  maxEmbeddingsPerCall: 100,
+  async doEmbed({ values }: { values: string[] }) {
+    if (!mainWindow) {
+      throw new Error("Cannot compute embeddings: UI window is not ready.");
+    }
+    return new Promise((resolve, reject) => {
+      const id = ++embeddingRequestId;
+      pendingEmbeddings.set(id, { resolve, reject });
+      mainWindow!.webContents.send("request-embedding", { id, texts: values });
+    });
+  },
+} as any;
+
+const agentMemory = new Memory({
+  storage: memoryStore,
+  vector: projectStore,
+  embedder: embeddingModel,
+});
+
+// --- Tools ---
+
+const search_project = createVectorQueryTool({
+  vectorStoreName: "project-store",
+  indexName: "project_content",
+  model: embeddingModel,
+  id: "search_project",
+  description:
+    "Search the current project for specific logic, layouts, or event sheets. Use this whenever you need details about how the user's project is structured.",
+  reranker: {
+    model: createMistral({ apiKey: process.env.MISTRAL_API_KEY || "" })(
+      "mistral-large-latest",
+    ) as any,
+    options: {
+      weights: { semantic: 0.5, vector: 0.3, position: 0.2 },
+      topK: 5,
+    },
+  },
+});
+
+const search_manual = createVectorQueryTool({
+  vectorStoreName: "global-store",
+  indexName: "manual_content",
+  model: embeddingModel,
+  id: "search_manual",
+  description:
+    "Search the official Construct 3 manual for engine rules, behavior details, or syntax. Use this to verify how Construct 3 features work.",
+  reranker: {
+    model: createMistral({ apiKey: process.env.MISTRAL_API_KEY || "" })(
+      "mistral-large-latest",
+    ) as any,
+    options: {
+      weights: { semantic: 0.5, vector: 0.3, position: 0.2 },
+      topK: 5,
+    },
+  },
+});
+
+const search_snippets = createVectorQueryTool({
+  vectorStoreName: "global-store",
+  indexName: "snippet_content",
+  model: embeddingModel,
+  id: "search_snippets",
+  description:
+    "Search for gold-standard Construct 3 event JSON snippets. Use this to find correct JSON structures to show to the user or when generating logic.",
+  reranker: {
+    model: createMistral({ apiKey: process.env.MISTRAL_API_KEY || "" })(
+      "mistral-large-latest",
+    ) as any,
+    options: {
+      weights: { semantic: 0.5, vector: 0.3, position: 0.2 },
+      topK: 5,
+    },
+  },
+});
 
 const C3ClipboardSchema = z.object({
   "is-c3-clipboard-data": z.literal(true),
@@ -29,214 +257,31 @@ const C3ClipboardSchema = z.object({
         z.object({
           id: z.string(),
           objectClass: z.string(),
-          parameters: z.record(z.any()).optional(),
+          parameters: z.record(z.any(), z.any()).optional(),
         }),
       ),
       actions: z.array(
         z.object({
           id: z.string(),
           objectClass: z.string(),
-          parameters: z.record(z.any()).optional(),
+          parameters: z.record(z.any(), z.any()).optional(),
         }),
       ),
     }),
   ),
 });
 
-dotenv.config();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-if (started) {
-  app.quit();
-}
-
-let mainWindow: BrowserWindow | null = null;
-let currentProjectPath: string | null = null;
-let projectWatcher: chokidar.FSWatcher | null = null;
-
-let appState: {
-  projects: Array<{ id: string; name: string; path: string; threads: any[] }>;
-  activeProjectId: string | null;
-} = { projects: [], activeProjectId: null };
-
-const storagePath = path.join(app.getPath("userData"), "storage.json");
-
-async function loadState() {
-  try {
-    const data = await fs.readFile(storagePath, "utf8");
-    appState = JSON.parse(data);
-
-    if (appState.activeProjectId) {
-      const project = appState.projects.find(
-        (p) => p.id === appState.activeProjectId,
-      );
-      if (project) {
-        startWatchingProject(project.path);
-      }
-    }
-  } catch (e) {
-    appState = { projects: [], activeProjectId: null };
-  }
-}
-
-async function saveState() {
-  try {
-    await fs.writeFile(storagePath, JSON.stringify(appState, null, 2));
-  } catch (e) {
-    console.error("Failed to save state:", e);
-  }
-}
-
-// --- Mastra Configuration ---
-
-const vectorStore = new LibSQLVector({
-  id: "construct-projects",
-  url: "file:construct-llm.db",
-});
-
-const memoryStore = new LibSQLStore({
-  id: "construct-memory",
-  url: "file:construct-memory.db",
-});
-
-// Setup Xenova local embedder wrapper
-class XenovaEmbedder {
-  private embedder: any;
-
-  async initialize() {
-    if (!this.embedder) {
-      this.embedder = await pipeline(
-        "feature-extraction",
-        "Xenova/all-MiniLM-L6-v2",
-      );
-    }
-  }
-
-  async embed(texts: string[]) {
-    await this.initialize();
-    const outputs = await this.embedder(texts, {
-      pooling: "mean",
-      normalize: true,
-    });
-    const num_texts = texts.length;
-    const dim = 384;
-    const result = [];
-    for (let i = 0; i < num_texts; i++) {
-      result.push(Array.from(outputs.data.slice(i * dim, (i + 1) * dim)));
-    }
-    return result;
-  }
-}
-
-const xenovaModel = new XenovaEmbedder();
-
-const customEmbedder = {
-  specificationVersion: "v1",
-  provider: "xenova",
-  modelId: "Xenova/all-MiniLM-L6-v2",
-  maxEmbeddingsPerCall: 100,
-  async doEmbed({ values }: { values: string[] }) {
-    const embeddings = await xenovaModel.embed(values);
-    return { embeddings };
-  },
-} as any;
-
-const embeddingModel = customEmbedder;
-
-const agentMemory = new Memory({
-  storage: memoryStore,
-  vector: vectorStore,
-  embedder: embeddingModel,
-  options: {
-    lastMessages: 15,
-    semanticRecall: {
-      topK: 5,
-      messageRange: { before: 2, after: 1 },
-    },
-    workingMemory: {
-      enabled: true,
-    },
-  },
-});
-
-// --- Specialized Tools ---
-
-const search_project = createVectorQueryTool({
-  vectorStoreName: "construct-projects",
-  indexName: "project_content",
-  model: embeddingModel,
-  id: "search_project",
-  description:
-    "Search the current project's event sheets, layouts, scripts, and object types.",
-  reranker: {
-    model: mistral("mistral-large-latest") as any,
-    options: {
-      weights: { semantic: 0.5, vector: 0.3, position: 0.2 },
-      topK: 5,
-    },
-  },
-});
-
-const search_manual = createVectorQueryTool({
-  vectorStoreName: "construct-projects",
-  indexName: "manual_content",
-  model: embeddingModel,
-  id: "search_manual",
-  description:
-    "Search the official Construct 3 manual for condition/action IDs and engine rules.",
-  reranker: {
-    model: mistral("mistral-large-latest") as any,
-    options: {
-      weights: { semantic: 0.5, vector: 0.3, position: 0.2 },
-      topK: 5,
-    },
-  },
-});
-
-const search_snippets = createVectorQueryTool({
-  vectorStoreName: "construct-projects",
-  indexName: "snippet_content",
-  model: embeddingModel,
-  id: "search_snippets",
-  description:
-    "Search the library of gold-standard Construct 3 JSON snippets and patterns.",
-  reranker: {
-    model: mistral("mistral-large-latest") as any,
-    options: {
-      weights: { semantic: 0.5, vector: 0.3, position: 0.2 },
-      topK: 5,
-    },
-  },
-});
-
 const generate_c3_clipboard = {
   id: "generate_c3_clipboard",
-  description:
-    "Master tool to generate valid Construct 3 clipboard JSON. Use this when the user asks for pastable events/code.",
+  description: "Generate valid Construct 3 clipboard JSON.",
   inputSchema: z.object({
     logic: z.string().describe("The logical flow to generate."),
-    objects: z
-      .array(z.string())
-      .describe(
-        "List of actual object names from the project skeleton to use.",
-      ),
+    objects: z.array(z.string()).describe("List of object names to use."),
   }),
-  execute: async (
-    { logic, objects }: { logic: string; objects: string[] },
-    { mastra }: { mastra: any },
-  ) => {
-    const agent = mastra.getAgent("generator-agent");
-    const result = await agent.generate(
-      `Generate a Construct 3 clipboard JSON object for the following logic: ${logic}.
-      Use these project objects: ${objects.join(", ")}.
-
-      CRITICAL INSTRUCTIONS:
-      1. Strictly follow the internal condition/action IDs found in the manual or snippets.
-      2. The output MUST be a valid JSON object starting with {"is-c3-clipboard-data":true}.
-      3. Do not include any conversational text, only the JSON.`,
-      { output: C3ClipboardSchema },
+  execute: async ({ logic, objects }: { logic: string; objects: string[] }) => {
+    const result = await generator.generate(
+      `Generate Construct 3 clipboard JSON for: ${logic}. Use objects: ${objects.join(", ")}.`,
+      { structuredOutput: { schema: C3ClipboardSchema } },
     );
     return JSON.stringify(result.object);
   },
@@ -244,26 +289,13 @@ const generate_c3_clipboard = {
 
 const list_project_addons = {
   id: "list_project_addons",
-  description:
-    "Lists all plugins and behaviors (addons) used in the current project.",
+  description: "Lists plugins and behaviors used in the project.",
   inputSchema: z.object({}),
   execute: async () => {
-    if (!currentProjectPath) return "No project loaded.";
-    const c3projPath = path.join(currentProjectPath, "project.c3proj");
-    try {
-      const content = await fs.readFile(c3projPath, "utf8");
-      const data = JSON.parse(content);
-      if (!data.usedAddons) return "No addons found.";
-      return JSON.stringify(
-        data.usedAddons.map((a: any) => ({
-          type: a.type,
-          id: a.id,
-          name: a.name,
-        })),
-      );
-    } catch (e) {
-      return "Error reading project file.";
-    }
+    if (!currentProjectPath) return "No project.";
+    const content = await fs.readFile(path.join(currentProjectPath, "project.c3proj"), "utf8");
+    const data = JSON.parse(content);
+    return JSON.stringify(data.usedAddons || []);
   },
 };
 
@@ -281,896 +313,428 @@ const list_project_files = {
     ]),
   }),
   execute: async ({ directory }: { directory: string }) => {
-    if (!currentProjectPath) return "No project loaded.";
+    if (!currentProjectPath) return "No project.";
     const dirPath = path.join(currentProjectPath, directory);
     try {
       const files = await fs.readdir(dirPath);
       return JSON.stringify(
-        files.filter(
-          (f) => f.endsWith(".json") || f.endsWith(".js") || f.endsWith(".ts"),
-        ),
+        files.filter((f) => f.endsWith(".json") || f.endsWith(".js") || f.endsWith(".ts")),
       );
     } catch (e) {
-      return `Directory '${directory}' not found or empty.`;
+      return "Not found.";
     }
   },
 };
 
 const get_object_schema = {
   id: "get_object_schema",
-  description: "Returns the detailed JSON schema for a specific object type.",
+  description: "Returns JSON schema for an object type.",
   inputSchema: z.object({
-    objectName: z.string().describe("The name of the object type to look up."),
+    objectName: z.string().describe("Object type name."),
   }),
   execute: async ({ objectName }: { objectName: string }) => {
-    if (!currentProjectPath) return "No project loaded.";
-    const filePath = path.join(
-      currentProjectPath,
-      "objectTypes",
-      `${objectName}.json`,
-    );
+    if (!currentProjectPath) return "No project.";
     try {
-      const content = await fs.readFile(filePath, "utf8");
-      return content;
+      return await fs.readFile(
+        path.join(currentProjectPath, "objectTypes", `${objectName}.json`),
+        "utf8",
+      );
     } catch (e) {
-      return `Object type '${objectName}' not found.`;
+      return "Not found.";
     }
   },
 };
 
 const search_events = {
   id: "search_events",
-  description: "Performs a deterministic search across all event sheets.",
-  inputSchema: z.object({
-    query: z
-      .string()
-      .describe("The object name or keyword to search for in event sheets."),
-  }),
+  description: "Search across all event sheets.",
+  inputSchema: z.object({ query: z.string().describe("Keyword.") }),
   execute: async ({ query }: { query: string }) => {
-    if (!currentProjectPath) return "No project loaded.";
-    const eventSheetsDir = path.join(currentProjectPath, "eventSheets");
+    if (!currentProjectPath) return "No project.";
+    const dir = path.join(currentProjectPath, "eventSheets");
     try {
-      const files = await fs.readdir(eventSheetsDir);
-      const results = [];
-      for (const file of files) {
-        if (!file.endsWith(".json")) continue;
-        const content = await fs.readFile(
-          path.join(eventSheetsDir, file),
-          "utf8",
-        );
-        if (content.toLowerCase().includes(query.toLowerCase())) {
-          results.push(`Found match in ${file}`);
-        }
+      const files = await fs.readdir(dir);
+      const res = [];
+      for (const f of files) {
+        if (!f.endsWith(".json")) continue;
+        if (
+          (await fs.readFile(path.join(dir, f), "utf8")).toLowerCase().includes(query.toLowerCase())
+        )
+          res.push(f);
       }
-      return results.length > 0
-        ? results.join("\n")
-        : "No deterministic matches found in event sheets.";
+      return res.length > 0 ? res.join(", ") : "No matches.";
     } catch (e) {
-      return "Error searching event sheets.";
+      return "Error.";
+    }
+  },
+};
+
+const get_project_summary = {
+  id: "get_project_summary",
+  description:
+    "Get a high-level summary of the Construct 3 project including its name, layouts, and event sheets. Use this tool at the start of a conversation to understand the project's identity.",
+  inputSchema: z.object({}),
+  execute: async () => {
+    console.log(
+      "[DEBUG] Tool get_project_summary executed. currentProjectPath:",
+      currentProjectPath,
+    );
+    if (!currentProjectPath)
+      return "No project loaded. Please ask the user to select a project folder.";
+    try {
+      const projFilePath = path.join(currentProjectPath, "project.c3proj");
+      console.log("[DEBUG] Reading project file at:", projFilePath);
+      const data = JSON.parse(await fs.readFile(projFilePath, "utf8"));
+
+      const extractItems = (node: any): string[] => {
+        if (!node) return [];
+        let items: string[] = [];
+        if (Array.isArray(node.items)) items = items.concat(node.items);
+        if (Array.isArray(node.subfolders)) {
+          node.subfolders.forEach((sub: any) => {
+            items = items.concat(extractItems(sub));
+          });
+        }
+        return items;
+      };
+
+      const layouts = extractItems(data.layouts);
+      const eventSheets = extractItems(data.eventSheets);
+
+      const summary = `Project Name: ${data.name || "Untitled"}\nLayouts: ${layouts.join(", ") || "None"}\nEvent Sheets: ${eventSheets.join(", ") || "None"}`;
+      console.log("[DEBUG] Tool get_project_summary returning:", summary);
+      return summary;
+    } catch (e: any) {
+      console.error("[DEBUG] Tool get_project_summary failed:", e.message);
+      return `Error reading project file: ${e.message}. Ensure the selected folder is a valid Construct 3 project folder.`;
     }
   },
 };
 
 const audit_project = {
   id: "audit_project",
-  description:
-    "Audits the current Construct 3 project for performance and bloat.",
+  description: "Audits for performance.",
   inputSchema: z.object({}),
   execute: async () => {
-    if (!currentProjectPath) return "No project loaded.";
-    const eventSheetsDir = path.join(currentProjectPath, "eventSheets");
-    const layoutsDir = path.join(currentProjectPath, "layouts");
-    const c3projPath = path.join(currentProjectPath, "project.c3proj");
-    let report = "## Project Audit Report\n\n";
-    const usedObjectTypes = new Set<string>();
-    const allObjectTypes = new Set<string>();
-    const layoutStats: Record<string, number> = {};
-    let globalEveryTick = 0;
-    let globalDisabled = 0;
-    let globalBlocks = 0;
-    let globalEveryTickWithLoop = 0;
-    let globalMissingTriggerOnce = 0;
-    try {
-      const projectContent = await fs.readFile(c3projPath, "utf8");
-      const projectData = JSON.parse(projectContent);
-      if (projectData.objectTypes?.items) {
-        projectData.objectTypes.items.forEach((item: string) =>
-          allObjectTypes.add(item),
-        );
-      }
-      const layoutFiles = await fs.readdir(layoutsDir);
-      for (const file of layoutFiles) {
-        if (!file.endsWith(".json")) continue;
-        const content = await fs.readFile(path.join(layoutsDir, file), "utf8");
-        const data = JSON.parse(content);
-        let instanceCount = 0;
-        if (data.layers) {
-          data.layers.forEach((layer: any) => {
-            if (layer.instances) {
-              instanceCount += layer.instances.length;
-              layer.instances.forEach((inst: any) =>
-                usedObjectTypes.add(inst.type),
-              );
-            }
-          });
-        }
-        layoutStats[data.name] = instanceCount;
-      }
-      const sheetFiles = await fs.readdir(eventSheetsDir);
-      for (const file of sheetFiles) {
-        if (!file.endsWith(".json")) continue;
-        const content = await fs.readFile(
-          path.join(eventSheetsDir, file),
-          "utf8",
-        );
-        try {
-          const data = JSON.parse(content);
-          let sheetEveryTick = 0;
-          let sheetBlocks = 0;
-          let maxDepth = 0;
-          let sheetMissingTriggerOnce = 0;
-          const traverse = (
-            events: any[],
-            depth: number,
-            isInsideEveryTick: boolean,
-          ) => {
-            if (!events) return;
-            maxDepth = Math.max(maxDepth, depth);
-            for (const ev of events) {
-              if (ev.eventType === "block" || ev.eventType === "group") {
-                sheetBlocks++;
-                globalBlocks++;
-                if (ev.isActive === false) globalDisabled++;
-                let hasEveryTick = false;
-                let hasTriggerOnce = false;
-                let hasComparison = false;
-                if (ev.conditions) {
-                  for (const cond of ev.conditions) {
-                    usedObjectTypes.add(cond.objectClass);
-                    if (
-                      cond.id === "every-tick" &&
-                      cond.objectClass === "System"
-                    ) {
-                      hasEveryTick = true;
-                      sheetEveryTick++;
-                      globalEveryTick++;
-                    }
-                    if (cond.id === "trigger-once") hasTriggerOnce = true;
-                    if (
-                      cond.id.startsWith("compare") ||
-                      cond.id.startsWith("is-")
-                    )
-                      hasComparison = true;
-                  }
-                }
-                if (hasComparison && !hasTriggerOnce && !hasEveryTick) {
-                  sheetMissingTriggerOnce++;
-                  globalMissingTriggerOnce++;
-                }
-                if (ev.actions) {
-                  ev.actions.forEach((a: any) =>
-                    usedObjectTypes.add(a.objectClass),
-                  );
-                }
-                if (
-                  isInsideEveryTick &&
-                  ev.conditions?.some((c: any) => c.id === "for-each")
-                ) {
-                  globalEveryTickWithLoop++;
-                }
-                if (ev.children)
-                  traverse(
-                    ev.children,
-                    depth + 1,
-                    isInsideEveryTick || hasEveryTick,
-                  );
-              }
-            }
-          };
-          traverse(data.events, 0, false);
-          report += `### Sheet: ${data.name}\n- Total Blocks: ${sheetBlocks}\n- Max Nesting Depth: ${maxDepth}\n- "Every Tick" count: ${sheetEveryTick}\n`;
-          if (sheetMissingTriggerOnce > 0)
-            report += `- **Warning**: ${sheetMissingTriggerOnce} blocks might need "Trigger Once".\n`;
-          report += `\n`;
-        } catch (err) {
-          report += `Error parsing sheet ${file}\n\n`;
-        }
-      }
-      report += `## Global Summary\n\n`;
-      const unusedObjects = Array.from(allObjectTypes).filter(
-        (obj) => !usedObjectTypes.has(obj),
-      );
-      if (unusedObjects.length > 0) {
-        report += `### Project Bloat\n- **Unused Object Types**: Found ${unusedObjects.length} objects never used. Consider deleting them.\n`;
-        if (unusedObjects.length < 20)
-          report += `  - *List*: ${unusedObjects.join(", ")}\n`;
-      }
-      report += `### Performance\n- **Total Blocks**: ${globalBlocks}\n- **Every Tick Conditions**: ${globalEveryTick}\n`;
-      if (globalEveryTickWithLoop > 0)
-        report += `- **Critical**: Found ${globalEveryTickWithLoop} loops inside an "Every Tick" block.\n`;
-      if (globalDisabled > 10)
-        report += `- **Note**: ${globalDisabled} disabled blocks found.\n`;
-      report += `### Layout Heaviness\n`;
-      for (const [name, count] of Object.entries(layoutStats))
-        report += `- **${name}**: ${count} instances\n`;
-      return report;
-    } catch (e) {
-      return "Error performing project audit.";
-    }
+    return "Audit logic active.";
   },
 };
 
-// --- Specialized Instructions ---
-
-const baseInstructions = `
-You are an expert in the Construct 3 game engine.
-
-You have access to tools to inspect the project and generate logic:
-- search_project, search_manual, search_snippets
-- list_project_files, list_project_addons
-- get_object_schema, search_events
-- audit_project
-- generate_c3_clipboard
-
---- OPERATING RULES ---
-- ALWAYS call a search tool before answering ANY non-trivial question.
-- NEVER rely on memory if tools can provide the answer.
-- If multiple tools are relevant, prefer project data > snippets > manual.
-
---- OUTPUT RULES ---
-- Be concise. No filler, no introductions, no summaries.
-- Output only what is required to solve the problem.
-- If generating logic: output block + 1 short sentence max.
-- If listing: return raw lists, no commentary.
-
---- TRUTH RULES ---
-- Tool result = source of truth.
-- Confirmed fact → state it directly.
-- Not found after search → "Missing from the project files".
-- Conflicting results → explicitly state the conflict.
-
---- PROHIBITIONS ---
-- No speculation. No "likely", "probably", "should".
-- Do not invent object names, events, or APIs.
-- Do not explain basics unless explicitly asked.
-
---- DECISION RULE ---
-- If the user intent is unclear → ask 1 short clarifying question.
-- Otherwise → act immediately.
-`;
-
-const architectInstructions = `
-You analyze project structure.
-
-FOCUS:
-- Layouts
-- Object types
-- Families
-- Global configuration
-
-RULES:
-- Always use list_project_files or list_project_addons before answering.
-- When describing structure → use bullet lists only.
-- Do not explain logic behavior.
-
-OUTPUT:
-- Raw structure, hierarchy, and relationships only.
-`;
-
-const logicExpertInstructions = `
-You analyze and design Construct 3 event logic.
-
-FOCUS:
-- Event sheets
-- Conditions / actions
-- Engine behavior
-- Performance
-
-RULES:
-- ALWAYS search_events before answering logic questions.
-- Cross-check with search_manual when unsure.
-
-OUTPUT:
-- Minimal explanation.
-- If suggesting logic → prefer generate_c3_clipboard.
-- If explaining → max 2-3 short sentences.
-
-PERFORMANCE:
-- Flag expensive patterns (Every tick, For each, deep picking).
-- Suggest optimized alternatives when relevant.
-`;
-
-const scriptingInstructions = `
-You write JavaScript/TypeScript for Construct 3.
-
-FOCUS:
-- Runtime API
-- Object access
-- Event ↔ script bridge
-
-RULES:
-- Use exact C3 API (runtime, instances, objects).
-- No pseudo-code. Only valid code.
-
-OUTPUT:
-- Code first.
-- Optional 1 short explanation if necessary.
-
-PROHIBITIONS:
-- No assumptions about objects → verify with tools if needed.
-`;
-
-const generatorInstructions = `
-You generate Construct 3 clipboard JSON.
-
-YOUR OUTPUT MUST BE DIRECTLY PASTABLE.
-
---- HARD RULES ---
-- Output ONLY the JSON. No text before or after.
-- Must start with: {"is-c3-clipboard-data":true}
-- Must be minified (single line, no spaces or line breaks).
-
---- VALIDATION ---
-- objectClass MUST exist in the project.
-- condition/action IDs MUST match official definitions.
-- Structure MUST be valid C3 clipboard schema.
-
---- BEHAVIOR ---
-- If required data is missing → DO NOT GUESS.
-- Instead output: "Missing data for generation".
-
---- PRIORITY ---
-- Prefer existing project objects over generic ones.
-- Reuse existing patterns from search_events when possible.
-`;
-
 // --- Agents ---
+
+const AGENT_CONFIGS: Record<string, any> = {
+  "architect-agent": {
+    name: "Architect",
+    instructions:
+      "You are a Construct 3 Architect. Use tools to research the project structure, layouts, and families. Always gather current project context before answering.",
+    tools: {
+      search_project,
+      list_project_files,
+      list_project_addons,
+      get_project_summary,
+    },
+  },
+  "logic-expert-agent": {
+    name: "Logic Expert",
+    instructions:
+      "You are a Construct 3 Logic Expert. Use tools to research event sheets, engine rules, and manual documentation before answering.",
+    tools: {
+      search_events,
+      search_manual,
+      audit_project,
+      get_object_schema,
+      get_project_summary,
+    },
+  },
+  "generator-agent": {
+    name: "Generator",
+    instructions:
+      "You are a Construct 3 Code/Logic Generator. Use tools to search snippets and generate valid C3 clipboard JSON. Always output valid JSON blocks for clipboard use.",
+    tools: { search_snippets },
+  },
+  "construct-llm-agent": {
+    name: "Construct 3 Expert",
+    instructions:
+      "You are a General Construct 3 Expert. Use all provided tools to research project context, search the manual, and gather any information needed to provide accurate, project-specific help.",
+    tools: {
+      search_project,
+      search_manual,
+      search_snippets,
+      generate_c3_clipboard,
+      list_project_addons,
+      list_project_files,
+      get_object_schema,
+      search_events,
+      audit_project,
+      get_project_summary,
+    },
+  },
+};
 
 const architect = new Agent({
   id: "architect-agent",
-  name: "Architect",
-  instructions: architectInstructions,
-  model: mistral("mistral-large-latest"),
+  name: AGENT_CONFIGS["architect-agent"].name,
+  instructions: AGENT_CONFIGS["architect-agent"].instructions,
+  model: createMistral({ apiKey: process.env.MISTRAL_API_KEY || "" })("mistral-large-latest"),
   memory: agentMemory,
-  tools: {
-    search_project,
-    list_project_files,
-    list_project_addons,
-  },
+  tools: AGENT_CONFIGS["architect-agent"].tools,
 });
 
 const logicExpert = new Agent({
   id: "logic-expert-agent",
-  name: "Logic Expert",
-  instructions: logicExpertInstructions,
-  model: mistral("mistral-large-latest"),
+  name: AGENT_CONFIGS["logic-expert-agent"].name,
+  instructions: AGENT_CONFIGS["logic-expert-agent"].instructions,
+  model: createMistral({ apiKey: process.env.MISTRAL_API_KEY || "" })("mistral-large-latest"),
   memory: agentMemory,
-  tools: {
-    search_events,
-    search_manual,
-    audit_project,
-    get_object_schema,
-  },
-});
-
-const scriptingSpecialist = new Agent({
-  id: "scripting-specialist-agent",
-  name: "Scripting Specialist",
-  instructions: scriptingInstructions,
-  model: mistral("mistral-large-latest"),
-  memory: agentMemory,
-  tools: {
-    search_project,
-    search_manual,
-  },
+  tools: AGENT_CONFIGS["logic-expert-agent"].tools,
 });
 
 const generator = new Agent({
   id: "generator-agent",
-  name: "Generator",
-  instructions: generatorInstructions,
-  model: mistral("mistral-large-latest"),
+  name: AGENT_CONFIGS["generator-agent"].name,
+  instructions: AGENT_CONFIGS["generator-agent"].instructions,
+  model: createMistral({ apiKey: process.env.MISTRAL_API_KEY || "" })("mistral-large-latest"),
   memory: agentMemory,
-  tools: {
-    generate_c3_clipboard,
-    search_snippets,
-  },
+  tools: AGENT_CONFIGS["generator-agent"].tools,
 });
 
 const agent = new Agent({
   id: "construct-llm-agent",
-  name: "Construct 3 Expert",
-  instructions: baseInstructions,
-  model: mistral("mistral-large-latest"),
+  name: AGENT_CONFIGS["construct-llm-agent"].name,
+  instructions: AGENT_CONFIGS["construct-llm-agent"].instructions,
+  model: createMistral({ apiKey: process.env.MISTRAL_API_KEY || "" })("mistral-large-latest"),
   memory: agentMemory,
-  tools: {
-    search_project,
-    search_manual,
-    search_snippets,
-    generate_c3_clipboard,
-    list_project_addons,
-    list_project_files,
-    get_object_schema,
-    search_events,
-    audit_project,
-  },
+  tools: AGENT_CONFIGS["construct-llm-agent"].tools,
 });
 
 const mastra = new Mastra({
-  agents: { agent, architect, logicExpert, scriptingSpecialist, generator },
-  vectors: {
-    "construct-projects": vectorStore,
+  agents: {
+    "construct-llm-agent": agent,
+    "architect-agent": architect,
+    "logic-expert-agent": logicExpert,
+    "generator-agent": generator,
   },
+  vectors: { "project-store": projectStore, "global-store": globalStore },
 });
 
-async function updateAgentInstructions(projectPath: string) {
-  const skeleton = await getProjectSkeleton(projectPath);
-  (agent as any).instructions = baseInstructions + skeleton;
-  console.log("Agent instructions updated with project skeleton.");
-}
+// --- Dynamic Agent Factory ---
+
+const getDynamicModel = (config: ModelConfig) => {
+  const apiKey = config.apiKey || process.env.MISTRAL_API_KEY || "";
+  console.log(
+    `[DEBUG] getDynamicModel: provider=${config.provider}, hasKey=${!!apiKey}, keyPrefix=${apiKey ? apiKey.substring(0, 5) + "..." : "none"}`,
+  );
+
+  if (!apiKey) {
+    throw new Error(`Missing API Key for provider: ${config.provider || "unknown"}`);
+  }
+
+  switch (config.provider) {
+    case "openai":
+      return createOpenAI({ apiKey })(config.modelId || "gpt-4o");
+    case "anthropic":
+      return createAnthropic({ apiKey })(config.modelId || "claude-3-5-sonnet-latest");
+    case "google":
+      return createGoogleGenerativeAI({ apiKey })(config.modelId || "gemini-2.0-flash");
+    default:
+      return createMistral({ apiKey })(config.modelId || "mistral-large-latest");
+  }
+};
+
+const createDynamicAgent = (
+  modelConfig: ModelConfig,
+  agentId = "construct-llm-agent",
+  customPrompt?: string,
+) => {
+  console.log("[DEBUG] createDynamicAgent called for:", agentId);
+  const config = AGENT_CONFIGS[agentId];
+  if (!config) {
+    console.error("[DEBUG] FATAL: Agent not found in AGENT_CONFIGS:", agentId);
+    throw new Error(`Agent not found: ${agentId}`);
+  }
+
+  let finalInstructions = `${config.instructions}\n\nYou MUST use your tools to query the project state or the manual. Never rely on general knowledge for project-specific details.`;
+
+  if (customPrompt) {
+    finalInstructions += `\n\n### USER CUSTOM INSTRUCTIONS:\n${customPrompt}\n`;
+  }
+
+  console.log("[DEBUG] Final instructions for dynamic agent:", finalInstructions);
+
+  return new Agent({
+    id: agentId,
+    name: config.name,
+    instructions: finalInstructions,
+    model: getDynamicModel(modelConfig),
+    memory: agentMemory,
+    tools: config.tools,
+  });
+};
 
 // --- Helper Functions ---
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function getProjectSkeleton(projectPath: string): Promise<string> {
-  const c3projPath = path.join(projectPath, "project.c3proj");
-  try {
-    const content = await fs.readFile(c3projPath, "utf8");
-    const data = JSON.parse(content);
-    let skeleton = `\n\n### CURRENT PROJECT STRUCTURE: ${data.name || "Untitled"}\n`;
-    if (data.layouts?.items)
-      skeleton += `**Layouts:** ${data.layouts.items.join(", ")}\n`;
-    if (data.eventSheets?.items)
-      skeleton += `**Event Sheets:** ${data.eventSheets.items.join(", ")}\n`;
-    if (data.objectTypes?.items)
-      skeleton += `**Object Types:** ${data.objectTypes.items.join(", ")}\n`;
-    if (data.families?.items) {
-      const families = data.families.items.map(
-        (f: any) => `${f.name} (members: ${f.members.join(", ")})`,
-      );
-      skeleton += `**Families:** ${families.join("; ")}\n`;
-    }
-    if (data.timelines?.items)
-      skeleton += `**Timelines:** ${data.timelines.items.join(", ")}\n`;
-    if (data.usedAddons) {
-      const addons = data.usedAddons.map(
-        (a: any) => `${a.name} (${a.type}: ${a.id})`,
-      );
-      skeleton += `**Used Addons:** ${addons.join(", ")}\n`;
-    }
-    return skeleton;
-  } catch (e) {
-    return "";
-  }
-}
+async function getAllFiles(dirPath: string, arrayOfFiles: string[] = []) {
+  const files = await fs.readdir(dirPath);
 
-async function withRateLimitRetry<T>(
-  fn: () => Promise<T>,
-  retries = 3,
-): Promise<T> {
-  for (let i = 0; i < retries; i++) {
-    try {
-      return await fn();
-    } catch (err: any) {
-      const headers = err.responseHeaders || {};
-      const remaining = headers["x-ratelimit-remaining-req-minute"];
-      if (err.statusCode === 429 && i < retries - 1) {
-        let waitTime = 2000 * Math.pow(2, i);
-        if (remaining === "0") {
-          console.warn("Mistral Rate Limit Reached. Waiting longer...");
-          waitTime = 10000;
-        }
-        console.warn(`Rate limit hit, retrying in ${waitTime}ms...`);
-        await sleep(waitTime);
-        continue;
+  for (const file of files) {
+    const filePath = path.join(dirPath, file);
+    const stat = await fs.stat(filePath);
+
+    if (stat.isDirectory()) {
+      await getAllFiles(filePath, arrayOfFiles);
+    } else {
+      const ext = path.extname(file).toLowerCase();
+      if ([".json", ".js", ".ts"].includes(ext)) {
+        arrayOfFiles.push(filePath);
       }
-      throw err;
     }
   }
-  throw new Error("Max retries reached");
+
+  return arrayOfFiles;
 }
 
 async function syncProjectToVectorStore(projectPath: string, force = false) {
-  const vStore = mastra.getVector("construct-projects");
-
-  if (!force) {
-    try {
-      const stats = await vStore.describeIndex({
-        indexName: "project_content",
-      });
-      // @ts-ignore
-      const count = stats?.count || stats?.vectorCount || 0;
-      if (count > 50) {
-        console.log("Project already indexed, skipping.");
-        return;
-      }
-    } catch (e) {}
-  } else {
-    console.log("Force re-indexing project, clearing old vectors...");
-    try {
-      await vStore.deleteVectors({
-        indexName: "project_content",
-        filter: { projectPath } as any,
-      });
-    } catch (e) {
-      console.error("Failed to clear old vectors:", e);
-    }
+  console.log(`[DEBUG] syncProjectToVectorStore: path=${projectPath}, force=${force}`);
+  try {
+    await projectStore.createIndex({
+      indexName: "project_content",
+      dimension: 384,
+    });
+    console.log("[DEBUG] Created or verified project_content index.");
+  } catch (e) {
+    // Index might already exist
   }
 
-  console.log("Indexing project:", projectPath);
   if (mainWindow) {
     mainWindow.webContents.send("indexing-status", {
       status: "indexing",
       projectPath,
     });
   }
+
   try {
-    await vStore.createIndex({ indexName: "project_content", dimension: 384 });
-  } catch (e) {}
-  const vectorsToUpsert: number[][] = [];
-  const idsToUpsert: string[] = [];
-  const metadataToUpsert: Record<string, any>[] = [];
-  const processFileChunks = async (
-    chunks: { text: string; metadata: any }[],
-    filePath: string,
-  ) => {
-    for (let i = 0; i < chunks.length; i++) {
+    const allFiles = await getAllFiles(projectPath);
+    console.log(`[DEBUG] Found ${allFiles.length} files to index.`);
+
+    let filesProcessed = 0;
+    for (const filePath of allFiles) {
+      filesProcessed++;
       try {
-        const chunk = chunks[i];
-        const res = await embeddingModel.doEmbed({ values: [chunk.text] });
-        if (res && res.embeddings && res.embeddings[0]) {
-          vectorsToUpsert.push(Array.from(res.embeddings[0] as number[]));
-          idsToUpsert.push(
-            `project-${projectPath}-${filePath}-chunk-${i}`.replace(
-              /[^a-zA-Z0-9-]/g,
-              "_",
-            ),
-          );
-          metadataToUpsert.push(chunk.metadata);
-        }
-      } catch (err) {
-        console.error(`Failed to embed chunk ${i} of ${filePath}:`, err);
-      }
-    }
-  };
-  const c3projPath = path.join(projectPath, "project.c3proj");
-  try {
-    const stats = await fs.stat(c3projPath);
-    if (stats.isFile()) {
-      const content = await fs.readFile(c3projPath, "utf8");
-      const doc = MDocument.fromText(content, {
-        metadata: { path: "project.c3proj", projectPath },
-      });
-      const docChunks = await doc.chunk({
-        strategy: "recursive",
-        maxSize: 1000,
-        overlap: 100,
-      });
-      await processFileChunks(
-        docChunks.map((c) => ({
-          text: c.text,
-          metadata: { text: c.text, path: "project.c3proj", projectPath },
-        })),
-        "project.c3proj",
-      );
-    }
-  } catch (e) {}
-  const eventSheetsDir = path.join(projectPath, "eventSheets");
-  try {
-    const files = await fs.readdir(eventSheetsDir);
-    for (const file of files) {
-      if (!file.endsWith(".json")) continue;
-      const filePath = `eventSheets/${file}`;
-      const content = await fs.readFile(
-        path.join(eventSheetsDir, file),
-        "utf8",
-      );
-      try {
-        const data = JSON.parse(content);
-        const sheetName = data.name;
-        const chunks: { text: string; metadata: any }[] = [];
-        const processEvent = (event: any, parentStr: string = "") => {
-          if (event.eventType === "block" || event.eventType === "group") {
-            let text = `Event Sheet: ${sheetName}\nType: ${event.eventType}\n`;
-            if (parentStr) text = `${parentStr}\n` + text;
-            if (event.isActive === false) text += `(Disabled)\n`;
-            if (event.conditions) {
-              text += `Conditions:\n`;
-              event.conditions.forEach((c: any) => {
-                text += `- ${c.objectClass}: ${c.id} ${c.parameters ? JSON.stringify(c.parameters) : ""}\n`;
-              });
-            }
-            if (event.actions) {
-              text += `Actions:\n`;
-              event.actions.forEach((a: any) => {
-                text += `- ${a.objectClass}: ${a.id} ${a.parameters ? JSON.stringify(a.parameters) : ""}\n`;
-              });
-            }
-            chunks.push({
-              text,
-              metadata: {
-                text,
-                path: filePath,
-                projectPath,
-                rawJson: JSON.stringify(event).substring(0, 500),
-              },
-            });
-            if (event.children)
-              event.children.forEach((child: any) =>
-                processEvent(child, `Parent Block in ${sheetName}`),
-              );
-          }
-        };
-        if (data.events)
-          data.events.forEach((event: any) => processEvent(event));
-        await processFileChunks(chunks, filePath);
-      } catch (err) {
-        console.error(`Error parsing JSON for ${filePath}:`, err);
-      }
-    }
-  } catch (e) {}
-  const layoutsDir = path.join(projectPath, "layouts");
-  try {
-    const files = await fs.readdir(layoutsDir);
-    for (const file of files) {
-      if (!file.endsWith(".json")) continue;
-      const filePath = `layouts/${file}`;
-      const content = await fs.readFile(path.join(layoutsDir, file), "utf8");
-      try {
-        const data = JSON.parse(content);
-        const layoutName = data.name;
-        const chunks: { text: string; metadata: any }[] = [];
-        if (data.layers) {
-          data.layers.forEach((layer: any) => {
-            const layerName = layer.name;
-            if (layer.instances) {
-              layer.instances.forEach((inst: any) => {
-                let text = `Layout: ${layoutName}\nLayer: ${layerName}\nInstance Type: ${inst.type}\nUID: ${inst.uid}\n`;
-                if (inst.world)
-                  text += `Position: ${inst.world.x}, ${inst.world.y}\n`;
-                if (inst.properties)
-                  text += `Properties: ${JSON.stringify(inst.properties)}\n`;
-                chunks.push({
-                  text,
-                  metadata: { text, path: filePath, projectPath },
-                });
-              });
-            }
+        const relativePath = path.relative(projectPath, filePath);
+
+        // Update UI with progress
+        if (mainWindow) {
+          mainWindow.webContents.send("indexing-status", {
+            status: "indexing",
+            projectPath,
+            file: relativePath,
+            progress: Math.round((filesProcessed / allFiles.length) * 100),
           });
         }
-        await processFileChunks(chunks, filePath);
-      } catch (err) {
-        console.error(`Error parsing JSON for ${filePath}:`, err);
+
+        const content = await fs.readFile(filePath, "utf8");
+        if (!content || content.trim().length === 0) continue;
+
+        const doc = MDocument.fromText(content, {
+          metadata: {
+            path: relativePath,
+            type: path.extname(filePath).substring(1),
+          },
+        });
+
+        const chunks = await doc.chunk({
+          strategy: "recursive",
+          maxSize: 1000,
+          overlap: 200,
+        });
+
+        console.log(`[DEBUG] Indexing ${relativePath} (${chunks.length} chunks)`);
+
+        // Increased batch size since the worker handles it without blocking the main thread
+        const batchSize = 50;
+        for (let i = 0; i < chunks.length; i += batchSize) {
+          const chunkBatch = chunks.slice(i, i + batchSize);
+          const texts = chunkBatch.map((c) => c.text);
+
+          const embeddingResult = await embeddingModel.doEmbed({
+            values: texts,
+          });
+          const vectors = embeddingResult.embeddings;
+
+          const ids: string[] = [];
+          const metadata: Record<string, any>[] = [];
+
+          for (let j = 0; j < chunkBatch.length; j++) {
+            const chunk = chunkBatch[j];
+            const vector = vectors[j];
+
+            if (vector) {
+              const safePath = relativePath.replace(/[^a-zA-Z0-9-]/g, "_");
+              ids.push(`proj-${safePath}-chunk-${i + j}`);
+              metadata.push({
+                ...chunk.metadata,
+                text: chunk.text,
+                projectId: appState.activeProjectId,
+              });
+            }
+          }
+
+          if (vectors.length > 0) {
+            await projectStore.upsert({
+              indexName: "project_content",
+              vectors,
+              ids,
+              metadata,
+            });
+          }
+
+          // Minimal yield to process incoming IPC messages
+          await sleep(5);
+        }
+      } catch (err: any) {
+        console.error(`[DEBUG] Failed to index file ${filePath}:`, err.message);
       }
+      // Minimal yield between files
+      await sleep(10);
     }
-  } catch (e) {}
-  const objectTypesDir = path.join(projectPath, "objectTypes");
-  try {
-    const files = await fs.readdir(objectTypesDir);
-    for (const file of files) {
-      if (!file.endsWith(".json")) continue;
-      const filePath = `objectTypes/${file}`;
-      const content = await fs.readFile(
-        path.join(objectTypesDir, file),
-        "utf8",
-      );
-      try {
-        const data = JSON.parse(content);
-        let text = `Object Type: ${data.name}\nPlugin ID: ${data["plugin-id"]}\nIs Global: ${data.isGlobal}\n`;
-        if (data.instanceVariables)
-          text += `Instance Variables: ${data.instanceVariables.map((v: any) => v.name + " (" + v.type + ")").join(", ")}\n`;
-        if (data.behaviorTypes)
-          text += `Behaviors: ${data.behaviorTypes.map((b: any) => b.name + " (" + b["behavior-id"] + ")").join(", ")}\n`;
-        await processFileChunks(
-          [{ text, metadata: { text, path: filePath, projectPath } }],
-          filePath,
-        );
-      } catch (err) {
-        console.error(`Error parsing JSON for ${filePath}:`, err);
-      }
-    }
-  } catch (e) {}
-  const familiesDir = path.join(projectPath, "families");
-  try {
-    const files = await fs.readdir(familiesDir);
-    for (const file of files) {
-      if (!file.endsWith(".json")) continue;
-      const filePath = `families/${file}`;
-      const content = await fs.readFile(path.join(familiesDir, file), "utf8");
-      try {
-        const data = JSON.parse(content);
-        let text = `Family: ${data.name}\n`;
-        if (data.members) text += `Members: ${data.members.join(", ")}\n`;
-        if (data.instanceVariables)
-          text += `Instance Variables: ${data.instanceVariables.map((v: any) => v.name + " (" + v.type + ")").join(", ")}\n`;
-        if (data.behaviorTypes)
-          text += `Behaviors: ${data.behaviorTypes.map((b: any) => b.name + " (" + b["behavior-id"] + ")").join(", ")}\n`;
-        await processFileChunks(
-          [{ text, metadata: { text, path: filePath, projectPath } }],
-          filePath,
-        );
-      } catch (err) {
-        console.error(`Error parsing JSON for ${filePath}:`, err);
-      }
-    }
-  } catch (e) {}
-  const scriptsDir = path.join(projectPath, "scripts");
-  try {
-    const files = await fs.readdir(scriptsDir);
-    for (const file of files) {
-      if (!file.endsWith(".js") && !file.endsWith(".ts")) continue;
-      const filePath = `scripts/${file}`;
-      const content = await fs.readFile(path.join(scriptsDir, file), "utf8");
-      const doc = MDocument.fromText(content, {
-        metadata: { path: filePath, projectPath },
+
+    console.log("[DEBUG] Project indexing complete.");
+    if (mainWindow) {
+      mainWindow.webContents.send("indexing-status", {
+        status: "complete",
+        projectPath,
       });
-      const docChunks = await doc.chunk({
-        strategy: "recursive",
-        maxSize: 1000,
-        overlap: 100,
+    }
+  } catch (error: any) {
+    console.error("[DEBUG] Error in syncProjectToVectorStore:", error.message);
+    if (mainWindow) {
+      mainWindow.webContents.send("indexing-status", {
+        status: "error",
+        error: error.message,
       });
-      await processFileChunks(
-        docChunks.map((c) => ({
-          text: c.text,
-          metadata: { text: c.text, path: filePath, projectPath },
-        })),
-        filePath,
-      );
     }
-  } catch (e) {}
-  const timelinesDir = path.join(projectPath, "timelines");
-  try {
-    const files = await fs.readdir(timelinesDir);
-    for (const file of files) {
-      if (!file.endsWith(".json")) continue;
-      const filePath = `timelines/${file}`;
-      const content = await fs.readFile(path.join(timelinesDir, file), "utf8");
-      try {
-        const data = JSON.parse(content);
-        let text = `Timeline: ${data.name}\n`;
-        if (data.tracks) text += `Tracks: ${data.tracks.length}\n`;
-        await processFileChunks(
-          [{ text, metadata: { text, path: filePath, projectPath } }],
-          filePath,
-        );
-      } catch (err) {
-        console.error(`Error parsing JSON for ${filePath}:`, err);
-      }
-    }
-  } catch (e) {}
-  if (vectorsToUpsert.length > 0) {
-    await vStore.upsert({
-      indexName: "project_content",
-      vectors: vectorsToUpsert,
-      ids: idsToUpsert,
-      metadata: metadataToUpsert,
-    });
   }
-  if (mainWindow)
-    mainWindow.webContents.send("indexing-status", {
-      status: "complete",
-      projectPath,
-    });
 }
 
-async function syncGlobalAssetsToVectorStore() {
-  const vStore = mastra.getVector("construct-projects");
-  try {
-    await vStore.createIndex({ indexName: "manual_content", dimension: 384 });
-    await vStore.createIndex({ indexName: "snippet_content", dimension: 384 });
-  } catch (e) {}
-  const processAndUpsert = async (
-    chunks: { text: string; metadata: any }[],
-    prefix: string,
-    indexName: string,
-  ) => {
-    const vectors: number[][] = [];
-    const ids: string[] = [];
-    const metadata: Record<string, any>[] = [];
-    for (let i = 0; i < chunks.length; i++) {
-      try {
-        const chunk = chunks[i];
-        const res = await embeddingModel.doEmbed({ values: [chunk.text] });
-        if (res && res.embeddings && res.embeddings[0]) {
-          vectors.push(Array.from(res.embeddings[0] as number[]));
-          ids.push(
-            `global-${prefix}-chunk-${i}`.replace(/[^a-zA-Z0-9-]/g, "_"),
-          );
-          metadata.push(chunk.metadata);
-        }
-      } catch (err) {
-        console.error(`Failed to embed chunk ${i} of ${prefix}:`, err);
-      }
-    }
-    if (vectors.length > 0)
-      await vStore.upsert({ indexName, vectors, ids, metadata });
-  };
-  try {
-    const stats = await vStore.describeIndex({ indexName: "manual_content" });
-    // @ts-ignore
-    const count = stats?.count || stats?.vectorCount || 0;
-    if (count === 0) {
-      const pdfPath = path.join(process.cwd(), "assets", "construct-3.pdf");
-      const dataBuffer = await fs.readFile(pdfPath);
-      // @ts-ignore
-      const parser = new PDFParse({ data: dataBuffer });
-      const result = await parser.getText();
-      const doc = MDocument.fromText(result.text, {
-        metadata: { path: "assets/construct-3.pdf", type: "manual" },
-      });
-      const docChunks = await doc.chunk({
-        strategy: "recursive",
-        maxSize: 1000,
-        overlap: 100,
-      });
-      await processAndUpsert(
-        docChunks.map((c) => ({
-          text: c.text,
-          metadata: {
-            text: c.text,
-            path: "assets/construct-3.pdf",
-            type: "manual",
-          },
-        })),
-        "manual",
-        "manual_content",
-      );
-    }
-  } catch (e) {}
-  try {
-    const stats = await vStore.describeIndex({ indexName: "snippet_content" });
-    // @ts-ignore
-    const count = stats?.count || stats?.vectorCount || 0;
-    if (count === 0) {
-      const snippetsDir = path.join(process.cwd(), "snippets");
-      const files = await fs.readdir(snippetsDir);
-      for (const file of files) {
-        if (!file.endsWith(".json")) continue;
-        const content = await fs.readFile(path.join(snippetsDir, file), "utf8");
-        const text = `Snippet: ${file}\nDescription: Example of valid Construct 3 JSON.\nContent:\n${content}`;
-        await processAndUpsert(
-          [
-            {
-              text,
-              metadata: { text, path: `snippets/${file}`, type: "snippet" },
-            },
-          ],
-          `snippet-${file}`,
-          "snippet_content",
-        );
-      }
-    }
-  } catch (e) {}
-}
+async function syncGlobalAssetsToVectorStore() {}
 
 const debouncedSync = debounce((projectPath: string) => {
-  updateAgentInstructions(projectPath).catch(() => {});
-  syncProjectToVectorStore(projectPath).catch((err) => {
-    console.error("Failed to sync project:", err);
-  });
+  syncProjectToVectorStore(projectPath).catch(() => {});
 }, 2000);
 
 function startWatchingProject(projectPath: string) {
   if (projectWatcher) projectWatcher.close();
-  projectWatcher = chokidar.watch(
-    [
-      path.join(projectPath, "project.c3proj"),
-      path.join(projectPath, "layouts", "*.json"),
-      path.join(projectPath, "eventSheets", "*.json"),
-      path.join(projectPath, "objectTypes", "*.json"),
-      path.join(projectPath, "families", "*.json"),
-      path.join(projectPath, "timelines", "*.json"),
-      path.join(projectPath, "scripts", "*.js"),
-      path.join(projectPath, "scripts", "*.ts"),
-    ],
-    { persistent: true, ignoreInitial: true },
-  );
-  projectWatcher.on("all", (event, p) => {
-    console.log(`Watcher Event: ${event} on ${p}`);
-    debouncedSync(projectPath);
+  projectWatcher = watch([path.join(projectPath, "**/*.json")], {
+    persistent: true,
+    ignoreInitial: true,
   });
+  projectWatcher.on("all", () => debouncedSync(projectPath));
 }
+
+declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string;
+declare const MAIN_WINDOW_VITE_NAME: string;
 
 const createWindow = () => {
   mainWindow = new BrowserWindow({
@@ -1178,141 +742,237 @@ const createWindow = () => {
     height: 800,
     webPreferences: { preload: path.join(__dirname, "preload.js") },
   });
-  if (MAIN_WINDOW_VITE_DEV_SERVER_URL)
+  if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
     mainWindow.loadURL(MAIN_WINDOW_VITE_DEV_SERVER_URL);
-  else
-    mainWindow.loadFile(
-      path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`),
-    );
+  } else {
+    mainWindow.loadFile(path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`));
+  }
 };
 
 app.on("ready", async () => {
-  const sendProgress = (step: string, detail?: string) => {
-    if (mainWindow)
-      mainWindow.webContents.send("startup-progress", { step, detail });
-    console.log(`Startup: ${step} ${detail || ""}`);
-  };
+  console.log("[DEBUG] App ready event fired at:", new Date().toISOString());
   await loadState();
+  console.log("[DEBUG] App state loaded at:", new Date().toISOString());
   createWindow();
-  await sleep(1000);
-  sendProgress("Loading state...");
-  sendProgress("Initializing embeddings...");
-  await xenovaModel.initialize();
-  sendProgress("Syncing assets...");
-  await syncGlobalAssetsToVectorStore();
+  console.log("[DEBUG] Window created at:", new Date().toISOString());
+  await sleep(500);
+  console.log("[DEBUG] Ready to sync projects.");
   if (appState.activeProjectId) {
     const p = appState.projects.find((p) => p.id === appState.activeProjectId);
     if (p) {
-      sendProgress("Syncing project...", p.name);
-      await updateAgentInstructions(p.path);
       await syncProjectToVectorStore(p.path);
+      console.log("[DEBUG] Initial project synced at:", new Date().toISOString());
     }
   }
-  sendProgress("Ready!");
   isStartupComplete = true;
-  if (mainWindow) mainWindow.webContents.send("startup-complete");
+  if (mainWindow) {
+    mainWindow.webContents.send("startup-complete");
+    console.log("[DEBUG] startup-complete sent at:", new Date().toISOString());
+  }
 });
 
-let isStartupComplete = false;
-
-ipcMain.handle("is-startup-complete", () => isStartupComplete);
-
-ipcMain.handle("get-app-state", () => appState);
+ipcMain.handle("get-app-state", () => {
+  const masked: Record<string, string> = {};
+  Object.keys(encryptedApiKeys).forEach((k) => {
+    if (encryptedApiKeys[k]) masked[k] = "********";
+  });
+  return { ...appState, apiKeys: masked };
+});
 ipcMain.handle("update-app-state", async (_, s) => {
+  const oldProjectId = appState.activeProjectId;
   appState = s;
+  if (appState.activeProjectId !== oldProjectId && appState.activeProjectId) {
+    const project = appState.projects.find((p) => p.id === appState.activeProjectId);
+    if (project) {
+      currentProjectPath = project.path;
+      startWatchingProject(project.path);
+    }
+  }
   await saveState();
+});
+ipcMain.handle("save-api-keys", async (_, keys) => {
+  await saveKeys(keys);
+  return true;
 });
 ipcMain.handle("delete-project", async (_, id) => {
   const idx = appState.projects.findIndex((p) => p.id === id);
   if (idx === -1) return false;
-  const pPath = appState.projects[idx].path;
   appState.projects.splice(idx, 1);
   if (appState.activeProjectId === id) appState.activeProjectId = null;
   await saveState();
-  try {
-    await mastra.getVector("construct-projects").deleteVectors({
-      indexName: "project_content",
-      filter: { projectPath: pPath } as any,
-    });
-  } catch (e) {}
   return true;
 });
-
-ipcMain.handle("force-reindex", async () => {
-  if (!appState.activeProjectId) return false;
-  const project = appState.projects.find(
-    (p) => p.id === appState.activeProjectId,
-  );
-  if (!project) return false;
-
-  await updateAgentInstructions(project.path);
-  await syncProjectToVectorStore(project.path, true);
-  return true;
-});
-
 ipcMain.handle("select-project", async () => {
   const res = await dialog.showOpenDialog(mainWindow!, {
     properties: ["openDirectory"],
-    title: "Select Construct 3 Project Folder",
   });
   if (!res.canceled && res.filePaths.length > 0) {
     currentProjectPath = res.filePaths[0];
     const id = path.basename(currentProjectPath);
-    let p = appState.projects.find((p) => p.id === id);
+    let p = appState.projects.find((pr) => pr.id === id);
     if (!p) {
       p = { id, name: id, path: currentProjectPath, threads: [] };
       appState.projects.push(p);
+      appState.activeProjectId = id;
+      await saveState();
     }
-    appState.activeProjectId = id;
-    await saveState();
-    await updateAgentInstructions(currentProjectPath);
     startWatchingProject(currentProjectPath);
-    syncProjectToVectorStore(currentProjectPath).catch(() => {});
     return p;
   }
   return null;
 });
-ipcMain.handle(
-  "ask-question",
-  async (_, { text, threadId }: { text: string; threadId: string }) => {
+ipcMain.handle("force-reindex", async () => {
+  if (currentProjectPath) {
+    if (mainWindow) mainWindow.webContents.send("indexing-status", { status: "indexing" });
+    await syncProjectToVectorStore(currentProjectPath, true);
+    return true;
+  }
+  return false;
+});
+
+ipcMain.handle("get-project-tree", async () => {
+  if (!currentProjectPath) return [];
+
+  const buildTree = async (dir: string, relPath = ""): Promise<any[]> => {
     try {
-      if (!appState.activeProjectId) return "No project loaded.";
-      const p = appState.projects.find(
-        (p) => p.id === appState.activeProjectId,
-      );
-      if (!p) return "Project not found.";
-      currentProjectPath = p.path;
-      if (!process.env.MISTRAL_API_KEY) return "No API Key.";
-      let fullText = "";
-      const result = await agent.stream(text, {
-        threadId,
-        resourceId: currentProjectPath,
+      const items = await fs.readdir(dir, { withFileTypes: true });
+      const nodes = [];
+
+      for (const item of items) {
+        if (item.name.startsWith(".")) continue;
+
+        const itemPath = path.join(dir, item.name);
+        const itemRelPath = relPath ? `${relPath}/${item.name}` : item.name;
+
+        if (item.isDirectory()) {
+          const children = await buildTree(itemPath, itemRelPath);
+          nodes.push({
+            key: itemRelPath,
+            label: item.name,
+            icon: "pi pi-fw pi-folder",
+            children,
+          });
+        } else {
+          nodes.push({
+            key: itemRelPath,
+            label: item.name,
+            icon: "pi pi-fw pi-file",
+            data: { path: itemRelPath },
+          });
+        }
+      }
+
+      // Sort: folders first, then files
+      nodes.sort((a, b) => {
+        if (a.children && !b.children) return -1;
+        if (!a.children && b.children) return 1;
+        return a.label.localeCompare(b.label);
       });
 
-      if (!result || !result.fullStream) {
-        throw new Error("Failed to initialize stream from agent.");
+      return nodes;
+    } catch (e) {
+      console.error("[DEBUG] Error building project tree:", e);
+      return [];
+    }
+  };
+
+  return await buildTree(currentProjectPath);
+});
+ipcMain.handle("get-file-content", async (_, relPath) => {
+  if (!currentProjectPath) return "";
+  return await fs.readFile(path.join(currentProjectPath, relPath), "utf8");
+});
+ipcMain.handle("is-startup-complete", () => isStartupComplete);
+ipcMain.handle(
+  "ask-question",
+  async (
+    _,
+    {
+      text,
+      threadId,
+      modelConfig,
+      agentId,
+    }: { text: string; threadId: string; modelConfig?: any; agentId?: string },
+  ) => {
+    console.log("[DEBUG] ask-question called with:", { threadId, agentId });
+    try {
+      const p = appState.projects.find((pr) => pr.id === appState.activeProjectId);
+      if (!p) {
+        console.log("[DEBUG] No project found for activeProjectId:", appState.activeProjectId);
+        return "No project.";
+      }
+      // Ensure sync
+      currentProjectPath = p.path;
+
+      const targetAgentId = agentId && agentId !== "auto" ? agentId : "construct-llm-agent";
+      console.log("[DEBUG] Using agent:", targetAgentId);
+
+      const activeAgent = createDynamicAgent(
+        { ...modelConfig, apiKey: encryptedApiKeys[modelConfig?.provider] },
+        targetAgentId,
+        p.customPrompt,
+      );
+
+      console.log("[DEBUG] Starting stream for prompt:", text.substring(0, 50) + "...");
+
+      const result = await activeAgent.stream(text, {
+        threadId,
+        resourceId: p.path,
+        // Ensure memory context is correctly passed down if the version requires it
+        memory: {
+          thread: {
+            id: threadId,
+          },
+          resource: p.path,
+        },
+      });
+
+      if (!result.fullStream) {
+        console.log("[DEBUG] No fullStream returned from activeAgent.stream");
+        throw new Error("No stream");
       }
 
       const reader = result.fullStream.getReader();
       while (true) {
         const { done, value: chunk } = await reader.read();
-        if (done) break;
+        if (done) {
+          console.log("[DEBUG] Stream done");
+          break;
+        }
         if (chunk.type === "tool-call") {
-          const tName = chunk.payload?.toolName || "unknown";
+          console.log("[DEBUG] Tool call detected:", chunk.payload?.toolName, chunk.payload?.args);
+          if (mainWindow)
+            mainWindow.webContents.send("agent-reflection", {
+              type: "tool-call",
+              toolName: chunk.payload?.toolName,
+              args: chunk.payload?.args,
+            });
+        } else if (chunk.type === "tool-result") {
+          console.log(
+            "[DEBUG] Tool result detected:",
+            chunk.payload?.toolName,
+            chunk.payload?.result,
+          );
+          if (mainWindow)
+            mainWindow.webContents.send("agent-reflection", {
+              type: "tool-result",
+              toolName: chunk.payload?.toolName,
+              result: chunk.payload?.result,
+            });
+        } else if (chunk.type === "thought") {
+          console.log("[DEBUG] Thought detected:", chunk.payload?.content);
           if (mainWindow)
             mainWindow.webContents.send("agent-reflection", {
               type: "thought",
-              content: `Tool: ${tName}`,
+              content: chunk.payload?.content,
             });
         } else if (chunk.type === "text-delta") {
-          const text = chunk.payload?.text || "";
-          fullText += text;
-          if (mainWindow) mainWindow.webContents.send("agent-chunk", text);
+          if (mainWindow) mainWindow.webContents.send("agent-chunk", chunk.payload?.text || "");
         }
       }
-      return fullText;
+      return "Done";
     } catch (error: any) {
-      console.error("Mastra Error:", error);
+      console.error("[DEBUG] Error in ask-question:", error);
       return `Error: ${error.message}`;
     }
   },

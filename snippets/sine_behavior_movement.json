@@ -4,9 +4,7 @@
   "items": [
     {
       "eventType": "block",
-      "conditions": [
-        { "id": "on-created", "objectClass": "FloatingItem" }
-      ],
+      "conditions": [{ "id": "on-created", "objectClass": "FloatingItem" }],
       "actions": [
         {
           "id": "set-enabled",

@@ -13,10 +13,7 @@
       "actions": [
         {
           "callFunction": "MyFunctionName",
-          "parameters": [
-            "\"Arg1\"",
-            "100"
-          ]
+          "parameters": ["\"Arg1\"", "100"]
         }
       ]
     }

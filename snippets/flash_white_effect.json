@@ -5,7 +5,11 @@
     {
       "eventType": "block",
       "conditions": [
-        { "id": "on-collision-with-another-object", "objectClass": "Enemy", "parameters": { "object": "PlayerSword" } }
+        {
+          "id": "on-collision-with-another-object",
+          "objectClass": "Enemy",
+          "parameters": { "object": "PlayerSword" }
+        }
       ],
       "actions": [
         {

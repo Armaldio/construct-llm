@@ -5,7 +5,11 @@
     {
       "eventType": "block",
       "conditions": [
-        { "id": "compare-instance-variable", "objectClass": "NPC", "parameters": { "instance-variable": "Talked", "comparison": 0, "value": "0" } }
+        {
+          "id": "compare-instance-variable",
+          "objectClass": "NPC",
+          "parameters": { "instance-variable": "Talked", "comparison": 0, "value": "0" }
+        }
       ],
       "actions": [
         {

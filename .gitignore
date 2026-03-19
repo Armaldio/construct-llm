@@ -92,5 +92,5 @@ typings/
 out/
 
 examples
-construct-llm.db*
+*.db*
 assets/construct-3.pdf

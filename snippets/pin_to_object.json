@@ -4,9 +4,7 @@
   "items": [
     {
       "eventType": "block",
-      "conditions": [
-        { "id": "on-created", "objectClass": "Attachment" }
-      ],
+      "conditions": [{ "id": "on-created", "objectClass": "Attachment" }],
       "actions": [
         {
           "id": "pin-to-object",

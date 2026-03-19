@@ -5,10 +5,18 @@
     {
       "eventType": "block",
       "conditions": [
-        { "id": "pick-nearest", "objectClass": "System", "parameters": { "object": "Enemy", "x": "Player.X", "y": "Player.Y" } }
+        {
+          "id": "pick-nearest",
+          "objectClass": "System",
+          "parameters": { "object": "Enemy", "x": "Player.X", "y": "Player.Y" }
+        }
       ],
       "actions": [
-        { "id": "set-instvar-value", "objectClass": "Player", "parameters": { "instance-variable": "TargetUID", "value": "Enemy.UID" } }
+        {
+          "id": "set-instvar-value",
+          "objectClass": "Player",
+          "parameters": { "instance-variable": "TargetUID", "value": "Enemy.UID" }
+        }
       ]
     }
   ]

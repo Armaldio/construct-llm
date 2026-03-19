@@ -5,7 +5,11 @@
     {
       "eventType": "block",
       "conditions": [
-        { "id": "on-button-pressed", "objectClass": "Gamepad", "parameters": { "gamepad": "0", "button": "button-b" } }
+        {
+          "id": "on-button-pressed",
+          "objectClass": "Gamepad",
+          "parameters": { "gamepad": "0", "button": "button-b" }
+        }
       ],
       "actions": [
         { "id": "go-to-layout", "objectClass": "System", "parameters": { "layout": "Menu" } }
