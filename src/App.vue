@@ -248,33 +248,17 @@ const models = [
   { provider: "google", modelId: "gemini-1.5-pro", label: "Gemini 1.5 Pro" },
 ];
 
-const isUserScrolling = ref(false);
-let isProgrammaticScroll = false;
-
-const handleScroll = (e: Event) => {
-  if (isProgrammaticScroll) {
-    isProgrammaticScroll = false;
-    return;
-  }
-  const el = e.target as HTMLElement;
-  if (!el) return;
-  const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-  // If user is more than 20px from bottom, they are "scrolling up"
-  isUserScrolling.value = distanceToBottom > 20;
-};
-
 const scrollToBottom = (force = false) => {
   if (messagesContainer.value) {
     const el = messagesContainer.value;
-    // Only scroll if forced OR if we are currently at the bottom
-    // We check this BEFORE nextTick to see the state before the new content is rendered
-    const wasAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 50;
 
-    if (force || wasAtBottom) {
+    // Check if we are currently "near" the bottom (within 100px)
+    // We check this BEFORE the nextTick to capture the user's current intent
+    const isAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
+
+    if (force || isAtBottom) {
       nextTick(() => {
-        isProgrammaticScroll = true;
         el.scrollTop = el.scrollHeight;
-        isUserScrolling.value = false;
       });
     }
   }
@@ -459,12 +443,14 @@ onMounted(async () => {
           for (let i = lastMsg.parts.length - 1; i >= 0; i--) {
             const part = lastMsg.parts[i];
             if (part.type === "reflection" && part.reflections) {
-              const lastToolCall = [...part.reflections].reverse().find(
-                (r) =>
-                  r.type === "tool" &&
-                  ((data.toolCallId && r.toolCallId === data.toolCallId) ||
-                    (!data.toolCallId && r.toolName === data.toolName && !r.result)),
-              );
+              const lastToolCall = [...part.reflections]
+                .reverse()
+                .find(
+                  (r) =>
+                    r.type === "tool" &&
+                    ((data.toolCallId && r.toolCallId === data.toolCallId) ||
+                      (!data.toolCallId && r.toolName === data.toolName && !r.result)),
+                );
 
               if (lastToolCall) {
                 lastToolCall.result = data.result;
@@ -487,12 +473,14 @@ onMounted(async () => {
             lastMsg.reflections.push(reflection);
           }
           // Also update the legacy reflections array
-          const legacyToolCall = [...lastMsg.reflections].reverse().find(
-            (r) =>
-              r.type === "tool" &&
-              ((data.toolCallId && r.toolCallId === data.toolCallId) ||
-                (!data.toolCallId && r.toolName === data.toolName && !r.result)),
-          );
+          const legacyToolCall = [...lastMsg.reflections]
+            .reverse()
+            .find(
+              (r) =>
+                r.type === "tool" &&
+                ((data.toolCallId && r.toolCallId === data.toolCallId) ||
+                  (!data.toolCallId && r.toolName === data.toolName && !r.result)),
+            );
           if (legacyToolCall) legacyToolCall.result = data.result;
         }
         scrollToBottom();
