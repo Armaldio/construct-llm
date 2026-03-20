@@ -38,9 +38,9 @@ interface Reflection {
 }
 
 interface ChatMessagePart {
-  type: "text" | "reflection";
-  content?: string;
-  reflections?: Reflection[];
+  type: "text" | "reflection" | "c3-clipboard";
+  content: string;
+  metadata?: any;
 }
 
 interface ChatMessage {
@@ -377,20 +377,20 @@ onMounted(async () => {
             existing.argsText += data.argsTextDelta || "";
 
             if (isRecordThought) {
-              try {
-                // Try to extract the thought string from partial JSON
-                const match = existing.argsText.match(/"thought"\s*:\s*"((?:[^"\\]|\\.)*)"?/);
-                if (match && match[1]) {
-                  const cleanText = match[1]
+              // Best practice: Extract "thought" without regex
+              const key = '"thought":';
+              const kIdx = existing.argsText.indexOf(key);
+              if (kIdx !== -1) {
+                const sIdx = existing.argsText.indexOf('"', kIdx + key.length);
+                if (sIdx !== -1) {
+                  let val = existing.argsText.substring(sIdx + 1);
+                  if (val.endsWith('"')) val = val.slice(0, -1);
+                  const cleanText = val
                     .replace(/\\n/g, "\n")
                     .replace(/\\"/g, '"')
                     .replace(/\\t/g, "\t");
                   existing.content = `Reasoning: ${cleanText}`;
-                } else {
-                  existing.content = `Reasoning: ${existing.argsText}`;
                 }
-              } catch (e) {
-                existing.content = `Reasoning: ${existing.argsText}`;
               }
             } else {
               existing.content = `Preparing tool: ${data.toolName}... (args: ${existing.argsText})`;
@@ -403,6 +403,21 @@ onMounted(async () => {
               toolName: data.toolName,
               toolCallId: data.toolCallId,
               argsText: data.argsTextDelta || "",
+            };
+            reflections.push(reflection);
+            lastMsg.reflections.push(reflection);
+          }
+        } else if (data.type === "thought") {
+          // Native thinking support
+          let existing = reflections.find((r) => r.type === "thought");
+          if (existing) {
+            existing.content += data.content || "";
+          } else {
+            const reflection: Reflection = {
+              id: Date.now(),
+              content: data.content || "",
+              type: "thought",
+              role: "assistant",
             };
             reflections.push(reflection);
             lastMsg.reflections.push(reflection);
@@ -488,26 +503,28 @@ onMounted(async () => {
     }
   });
 
-  (window as any).api.onAgentChunk((chunk: string) => {
+  (window as any).api.onAgentChunk((data: string | { text: string; metadata?: any }) => {
     if (activeThread.value) {
       const messages = activeThread.value.messages;
       const lastMsg = messages[messages.length - 1];
       if (lastMsg && lastMsg.role === "assistant") {
+        const chunk = typeof data === "string" ? data : data.text;
+        const metadata = typeof data === "object" ? data.metadata : undefined;
+
         if (!lastMsg.parts) lastMsg.parts = [];
 
         // Remove any transient placeholders when real text arrives
         lastMsg.parts.forEach((p) => {
-          if (p.type === "reflection" && p.reflections) {
-            p.reflections = p.reflections.filter((r) => !r.transient);
+          if (p.type === "reflection" && (p as any).reflections) {
+            (p as any).reflections = (p as any).reflections.filter((r: any) => !r.transient);
           }
         });
-        if (lastMsg.reflections) {
-          lastMsg.reflections = lastMsg.reflections.filter((r) => !r.transient);
-        }
+
+        const targetType = metadata?.type === "c3-clipboard" ? "c3-clipboard" : "text";
 
         let lastPart = lastMsg.parts[lastMsg.parts.length - 1];
-        if (!lastPart || lastPart.type !== "text") {
-          lastPart = { type: "text", content: "" };
+        if (!lastPart || lastPart.type !== targetType) {
+          lastPart = { type: targetType, content: "", metadata };
           lastMsg.parts.push(lastPart);
         }
 
@@ -807,23 +824,32 @@ const parseMessageContent = (content: string) => {
   if (!content) return [];
   const segments: Array<{ type: "text" | "c3-clipboard"; content: string }> = [];
 
-  // Regex to find the start of a C3 clipboard JSON block
-  const startRegex = /\{[\s\n]*"is-c3-clipboard-data"[\s\n]*:[\s\n]*true/g;
-
+  const marker = '"is-c3-clipboard-data":true';
   let lastIndex = 0;
-  let match;
 
-  while ((match = startRegex.exec(content)) !== null) {
-    const startIndex = match.index;
+  while (true) {
+    const markerIndex = content.indexOf(marker, lastIndex);
+    if (markerIndex === -1) break;
 
-    // Check if we have text before this block
+    // Find the opening brace of the object containing this marker
+    let startIndex = -1;
+    for (let i = markerIndex; i >= lastIndex; i--) {
+      if (content[i] === "{") {
+        startIndex = i;
+        break;
+      }
+    }
+
+    if (startIndex === -1) {
+      lastIndex = markerIndex + marker.length;
+      continue;
+    }
+
     let blockStartIndex = startIndex;
-
-    // Try to find the matching closing brace
     let depth = 0;
-    let endIndex = -1;
     let inString = false;
     let escape = false;
+    let endIndex = -1;
 
     for (let i = startIndex; i < content.length; i++) {
       const char = content[i];
@@ -831,7 +857,7 @@ const parseMessageContent = (content: string) => {
         escape = false;
         continue;
       }
-      if (char === "\\\\") {
+      if (char === "\\") {
         escape = true;
         continue;
       }
@@ -853,7 +879,7 @@ const parseMessageContent = (content: string) => {
 
     if (endIndex === -1) {
       // Incomplete JSON (maybe still streaming)
-      continue;
+      break;
     }
 
     let blockEndIndex = endIndex + 1;
@@ -862,13 +888,13 @@ const parseMessageContent = (content: string) => {
     const beforeBlock = content.substring(lastIndex, startIndex);
     const afterBlock = content.substring(blockEndIndex);
 
-    const codeBlockStartMatch = beforeBlock.match(/```(?:json)?\s*$/);
-    const codeBlockEndMatch = afterBlock.match(/^\s*```/);
+    const bTrim = beforeBlock.trimEnd();
+    const aTrim = afterBlock.trimStart();
 
-    if (codeBlockStartMatch && codeBlockEndMatch) {
-      // It's wrapped in backticks, let's include them in the "to be replaced" area
-      blockStartIndex = startIndex - codeBlockStartMatch[0].length;
-      blockEndIndex = blockEndIndex + codeBlockEndMatch[0].length;
+    if ((bTrim.endsWith("```json") || bTrim.endsWith("```")) && aTrim.startsWith("```")) {
+      const markerLen = bTrim.endsWith("```json") ? 7 : 3;
+      blockStartIndex = startIndex - (beforeBlock.length - bTrim.length + markerLen);
+      blockEndIndex = blockEndIndex + (afterBlock.length - aTrim.length + 3);
     }
 
     // Push preceding text segment
@@ -881,8 +907,6 @@ const parseMessageContent = (content: string) => {
     segments.push({ type: "c3-clipboard", content: jsonContent });
 
     lastIndex = blockEndIndex;
-    // Reset regex index to after our found block
-    startRegex.lastIndex = lastIndex;
   }
 
   // Push remaining text
@@ -1046,6 +1070,11 @@ const copyToClipboard = (text: string) => {
                         : [{ type: 'text', content: msg.content }]"
                       :key="pIndex"
                     >
+                      <!-- C3 Clipboard Part (Directly from Generator) -->
+                      <div v-if="part.type === 'c3-clipboard'" class="c3-clipboard-part mb-4">
+                        <C3EventPreview :json="part.content" />
+                      </div>
+
                       <!-- Reflection Part -->
                       <div
                         v-if="

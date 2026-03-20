@@ -346,7 +346,7 @@ ${objects.join(", ")}
 
 ${contextSnippets ? `### REFERENCE SNIPPETS:\n${contextSnippets}` : ""}
 
-Output ONLY the JSON object following the schema.`;
+Output ONLY the JSON object following the schema. Do not include any other text or Markdown blocks.`;
 
       // Use the base generator agent but WITHOUT tools to prevent recursion
       const simpleGenerator = new Agent({
@@ -360,7 +360,8 @@ Output ONLY the JSON object following the schema.`;
         structuredOutput: { schema: C3ClipboardSchema },
       });
 
-      return JSON.stringify(result.object);
+      // We return the raw object so the caller (chat-message handler) can identify it
+      return result.object;
     } catch (e: any) {
       console.error("[DEBUG] Error in generate_c3_clipboard tool:", e.message);
       return `Error generating clipboard JSON: ${e.message}`;
@@ -613,15 +614,17 @@ const mastra = new Mastra({
 
 // --- Dynamic Agent Factory ---
 
-const getDynamicModel = (config: ModelConfig) => {
+const getDynamicModel = (config: ModelConfig & { jsonMode?: boolean }) => {
   const apiKey = config.apiKey || process.env.MISTRAL_API_KEY || "";
   console.log(
-    `[DEBUG] getDynamicModel: provider=${config.provider}, hasKey=${!!apiKey}, keyPrefix=${apiKey ? apiKey.substring(0, 5) + "..." : "none"}`,
+    `[DEBUG] getDynamicModel: provider=${config.provider}, hasKey=${!!apiKey}, keyPrefix=${apiKey ? apiKey.substring(0, 5) + "..." : "none"}, jsonMode=${!!config.jsonMode}`,
   );
 
   if (!apiKey) {
     throw new Error(`Missing API Key for provider: ${config.provider || "unknown"}`);
   }
+
+  const modelOptions = config.jsonMode ? { structuredOutput: true } : {};
 
   switch (config.provider) {
     case "openai":
@@ -1091,7 +1094,11 @@ ipcMain.handle(
             });
         } else if (chunk.type === "text-delta") {
           const text = chunk.payload?.textDelta || chunk.payload?.text || "";
-          if (mainWindow) mainWindow.webContents.send("agent-chunk", text);
+          if (mainWindow)
+            mainWindow.webContents.send("agent-chunk", {
+              text,
+              metadata: targetAgentId === "generator-agent" ? { type: "c3-clipboard" } : undefined,
+            });
         } else if (chunk.type === "tool-call-delta") {
           if (mainWindow)
             mainWindow.webContents.send("agent-reflection", {
