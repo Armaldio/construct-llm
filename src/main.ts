@@ -297,14 +297,14 @@ const C3ClipboardSchema = z.object({
         z.object({
           id: z.string(),
           objectClass: z.string(),
-          parameters: z.record(z.any(), z.any()).optional(),
+          parameters: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
         }),
       ),
       actions: z.array(
         z.object({
           id: z.string(),
           objectClass: z.string(),
-          parameters: z.record(z.any(), z.any()).optional(),
+          parameters: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
         }),
       ),
     }),
