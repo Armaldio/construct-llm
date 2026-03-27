@@ -14,16 +14,24 @@ import {
 import {
   getGlobalMainWindow,
   pendingEmbeddings,
-  getProjectStore,
 } from "./mastra";
 import {
   startWatchingProject,
-  syncProjectToVectorStore,
 } from "./utils";
 import { AGENTS_MAP } from "./agents";
 import { setLastUsedModelConfig } from "./tools";
 import { ModelConfig } from "./types";
 import { getDynamicModel } from "./config";
+
+// God Tier: Cost Lookup Table (Price per 1M tokens in USD)
+const MODEL_PRICING: Record<string, { prompt: number; completion: number }> = {
+  "mistral-large-latest": { prompt: 2.0, completion: 6.0 },
+  "mistral-small-latest": { prompt: 0.2, completion: 0.6 },
+  "gemini-1.5-pro": { prompt: 1.25, completion: 3.75 },
+  "gemini-1.5-flash": { prompt: 0.075, completion: 0.3 },
+  "gpt-4o": { prompt: 5.0, completion: 15.0 },
+  "claude-3-5-sonnet-latest": { prompt: 3.0, completion: 15.0 },
+};
 
 export function setupIpcHandlers() {
   const mainWindow = getGlobalMainWindow();
@@ -31,11 +39,8 @@ export function setupIpcHandlers() {
   ipcMain.on("embedding-result", (event, { id, embeddings, error }) => {
     const promiseHandlers = pendingEmbeddings.get(id);
     if (promiseHandlers) {
-      if (error) {
-        promiseHandlers.reject(new Error(error));
-      } else {
-        promiseHandlers.resolve({ embeddings });
-      }
+      if (error) promiseHandlers.reject(new Error(error));
+      else promiseHandlers.resolve({ embeddings });
       pendingEmbeddings.delete(id);
     }
   });
@@ -53,10 +58,7 @@ export function setupIpcHandlers() {
     setAppState(s);
     if (appState.activeProjectId !== oldProjectId && appState.activeProjectId) {
       const project = appState.projects.find((p) => p.id === appState.activeProjectId);
-      if (project) {
-        startWatchingProject(project.id, project.path);
-        await saveState();
-      }
+      if (project) startWatchingProject(project.id, project.path);
     }
     await saveState();
   });
@@ -76,9 +78,7 @@ export function setupIpcHandlers() {
   });
 
   ipcMain.handle("select-project", async () => {
-    const res = await dialog.showOpenDialog(mainWindow!, {
-      properties: ["openDirectory"],
-    });
+    const res = await dialog.showOpenDialog(mainWindow!, { properties: ["openDirectory"] });
     if (!res.canceled && res.filePaths.length > 0) {
       const projectPath = res.filePaths[0];
       const id = path.basename(projectPath);
@@ -89,22 +89,10 @@ export function setupIpcHandlers() {
         appState.activeProjectId = id;
         await saveState();
       }
-      if (projectPath && appState.activeProjectId) {
-        startWatchingProject(appState.activeProjectId, projectPath);
-      }
+      if (projectPath && appState.activeProjectId) startWatchingProject(appState.activeProjectId, projectPath);
       return p;
     }
     return null;
-  });
-
-  ipcMain.handle("force-reindex", async () => {
-    const project = appState.projects.find(p => p.id === appState.activeProjectId);
-    if (project?.path) {
-      if (mainWindow) mainWindow.webContents.send("indexing-status", { status: "indexing" });
-      await syncProjectToVectorStore(project.path, true);
-      return true;
-    }
-    return false;
   });
 
   ipcMain.handle("get-project-tree", async () => {
@@ -192,10 +180,7 @@ export function setupIpcHandlers() {
         });
         const { text } = await generateText({
           model,
-          prompt: `Generate a very short, concise title (max 5 words) for a conversation that started with:
-User: "${userMessage}"
-Assistant: "${assistantResponse.substring(0, 200)}..."
-Return ONLY the title text, no quotes or punctuation.`,
+          prompt: `Generate a very short, concise title (max 5 words) for a conversation that started with:\nUser: "${userMessage}"\nAssistant: "${assistantResponse.substring(0, 200)}..."\nReturn ONLY the title text, no quotes or punctuation.`,
         });
         return text.replace(/["']/g, "").trim();
       } catch (e) {
@@ -205,145 +190,83 @@ Return ONLY the title text, no quotes or punctuation.`,
     },
   );
 
-  ipcMain.handle(
-    "ask-question",
-    async (
-      _,
-      {
-        text,
-        threadId,
-        modelConfig,
-        agentId,
-      }: { text: string; threadId: string; modelConfig?: ModelConfig; agentId?: string },
-    ) => {
-      try {
-        const p = appState.projects.find((pr) => pr.id === appState.activeProjectId);
-        if (!p) {
-          return "No project.";
+  ipcMain.handle("ask-question", async (_, { text, threadId, modelConfig, agentId }) => {
+    try {
+      const p = appState.projects.find((pr) => pr.id === appState.activeProjectId);
+      if (!p) return "No project.";
+
+      const targetAgentId = agentId && agentId !== "auto" ? agentId : "construct-llm-agent";
+      const provider = modelConfig?.provider || "mistral";
+      const modelId = modelConfig?.modelId || "mistral-large-latest";
+      
+      console.log(`[AI Query] Start: ${modelId} (${provider})`);
+      
+      const currentConfig: ModelConfig = { provider, modelId, apiKey: encryptedApiKeys[provider] };
+      setLastUsedModelConfig(currentConfig);
+
+      const agent = AGENTS_MAP[targetAgentId];
+      if (!agent) throw new Error(`Agent not found: ${targetAgentId}`);
+
+      const requestContext = new RequestContext();
+      requestContext.set("modelConfig", currentConfig);
+      requestContext.set("customPrompt", p.customPrompt);
+
+      const result = await agent.stream(text, {
+        maxSteps: 10,
+        requestContext,
+        memory: { thread: { id: threadId }, resource: appState.activeProjectId || "default" },
+      });
+
+      const reader = result.fullStream.getReader();
+      let promptTokens = 0;
+      let completionTokens = 0;
+
+      while (true) {
+        const { done, value: chunk } = await reader.read();
+        if (done) break;
+
+        const chunkAny = chunk as any;
+
+        // God Tier: Rich Reflections with Emojis
+        if (chunk.type === "tool-call") {
+          const name = chunkAny.payload?.toolName || "";
+          let label = `⚡ Thinking... (using ${name})`;
+          if (name.includes("read_file")) label = `📂 Reading file...`;
+          if (name.includes("search")) label = `🔍 Searching project...`;
+          
+          console.log(`[AI Tool] Using: ${name}`);
+          
+          mainWindow?.webContents.send("agent-reflection", { type: "thought", content: label, transient: true });
+        } else if (chunk.type === "text-delta") {
+          const text = chunkAny.payload?.textDelta || chunkAny.textDelta || "";
+          mainWindow?.webContents.send("agent-chunk", { text });
+        } else if (chunkAny.type === "thought" || chunkAny.type === "reasoning") {
+          mainWindow?.webContents.send("agent-reflection", { type: "thought", content: chunkAny.payload?.text || chunkAny.text });
         }
-
-        const targetAgentId = agentId && agentId !== "auto" ? agentId : "construct-llm-agent";
-
-        const provider = modelConfig?.provider || "mistral";
-        const currentModelConfig: ModelConfig = {
-          provider,
-          modelId: modelConfig?.modelId || "mistral-large-latest",
-          apiKey: encryptedApiKeys[provider],
-        };
-        setLastUsedModelConfig(currentModelConfig);
-
-        const activeAgent = AGENTS_MAP[targetAgentId];
-        if (!activeAgent) {
-          throw new Error(`Agent not found: ${targetAgentId}`);
-        }
-
-        const requestContext = new RequestContext();
-        requestContext.set("modelConfig", currentModelConfig);
-        requestContext.set("customPrompt", p.customPrompt);
-
-        const result = await activeAgent.stream(text, {
-          maxSteps: 10,
-          requestContext,
-          memory: {
-            thread: { id: threadId },
-            resource: appState.activeProjectId || "default-project",
-          },
-        });
-
-        if (!result.fullStream) {
-          throw new Error("No stream");
-        }
-
-        const reader = result.fullStream.getReader();
-        while (true) {
-          const { done, value: chunk } = await reader.read();
-          if (done) {
-            break;
-          }
-
-          const chunkAny = chunk as any;
-
-          if (chunk.type === "tool-call") {
-            if (mainWindow)
-              mainWindow.webContents.send("agent-reflection", {
-                type: "tool-call",
-                toolName: chunkAny.payload?.toolName,
-                args: chunkAny.payload?.args,
-                toolCallId: chunkAny.payload?.toolCallId,
-              });
-          } else if (chunk.type === "tool-result") {
-            if (mainWindow)
-              mainWindow.webContents.send("agent-reflection", {
-                type: "tool-result",
-                toolName: chunkAny.payload?.toolName,
-                result: chunkAny.payload?.result,
-                toolCallId: chunkAny.payload?.toolCallId,
-              });
-          } else if (
-            chunk.type === "reasoning-delta" ||
-            chunk.type === "reasoning-start" ||
-            chunk.type === ("thought" as any)
-          ) {
-            if (mainWindow)
-              mainWindow.webContents.send("agent-reflection", {
-                type: "thought",
-                content:
-                  chunkAny.payload?.content ||
-                  chunkAny.payload?.textDelta ||
-                  chunkAny.payload?.text ||
-                  chunkAny.textDelta,
-              });
-          } else if (chunk.type === "text-delta") {
-            const text =
-              chunkAny.payload?.textDelta || chunkAny.payload?.text || chunkAny.textDelta || "";
-            if (mainWindow)
-              mainWindow.webContents.send("agent-chunk", {
-                text,
-                metadata: targetAgentId === "generator-agent" ? { type: "c3-clipboard" } : undefined,
-              });
-          } else if (chunk.type === "tool-call-delta") {
-            if (mainWindow)
-              mainWindow.webContents.send("agent-reflection", {
-                type: "tool-call-delta",
-                toolName: chunkAny.payload?.toolName,
-                argsTextDelta: chunkAny.payload?.argsTextDelta || chunkAny.argsTextDelta,
-                toolCallId: chunkAny.payload?.toolCallId || chunkAny.toolCallId,
-              });
-          } else if (chunk.type === ("step-start" as any)) {
-            if (mainWindow)
-              mainWindow.webContents.send("agent-reflection", {
-                type: "thought",
-                content: "Agent is starting a new reasoning step...",
-                transient: true,
-              });
-          } else if (chunk.type === "error") {
-            console.error("[DEBUG] Agent error chunk:", chunkAny.payload || chunkAny.error);
-          }
-        }
-        return "Done";
-      } catch (error: any) {
-        console.error("[DEBUG] Error in ask-question:", error);
-        let userFriendlyError = `Error: ${error.message}`;
-
-        if (error.message.includes("quota") || error.statusCode === 429) {
-          if (error.message.includes("limit: 0")) {
-            userFriendlyError =
-              "Gemini Quota Error (Limit: 0). This usually means the Free Tier is restricted in your region (e.g., Europe/UK). You must enable 'Pay-as-you-go' in Google AI Studio to use the API, even if you stay within the free usage limits.";
-          } else {
-            userFriendlyError =
-              "Gemini Rate Limit Exceeded. If you are on the Free Tier, wait 1 minute or enable 'Pay-as-you-go' in Google AI Studio to increase your TPM/RPM limits.";
-          }
-        } else if (error.message.includes("API Key")) {
-          userFriendlyError = error.message;
-        }
-
-        if (mainWindow) {
-          mainWindow.webContents.send("agent-chunk", {
-            text: `\n\n> ⚠️ **${userFriendlyError}**`,
-          });
-        }
-        return `Error: ${error.message}`;
       }
-    },
-  );
+
+      // God Tier: Token Usage & Cost Reflection
+      const usage = await result.usage;
+      if (usage) {
+        promptTokens = (usage as any).promptTokens || 0;
+        completionTokens = (usage as any).completionTokens || 0;
+        
+        const pricing = MODEL_PRICING[modelId] || { prompt: 0, completion: 0 };
+        const cost = (promptTokens / 1_000_000) * pricing.prompt + (completionTokens / 1_000_000) * pricing.completion;
+
+        console.log(`[AI Query] Complete: ${promptTokens + completionTokens} tokens used (Cost: ~$${cost.toFixed(4)})`);
+
+        mainWindow?.webContents.send("agent-reflection", {
+          type: "usage",
+          content: `📊 **Usage Stats:** ${promptTokens + completionTokens} tokens used (Cost: ~$${cost.toFixed(4)})`,
+        });
+      }
+
+      return "Done";
+    } catch (error: any) {
+      console.error("[DEBUG] Error:", error);
+      mainWindow?.webContents.send("agent-chunk", { text: `\n\n> ⚠️ **Error: ${error.message}**` });
+      return `Error: ${error.message}`;
+    }
+  });
 }

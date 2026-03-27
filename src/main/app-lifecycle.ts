@@ -8,7 +8,7 @@ import {
   globalStore,
 } from "./mastra";
 import { appState, loadState } from "./state";
-import { startWatchingProject, syncProjectToVectorStore, sleep } from "./utils";
+import { startWatchingProject, sleep } from "./utils";
 import { setupIpcHandlers } from "./ipc";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -67,7 +67,6 @@ export function setupAppLifecycle() {
       const p = appState.projects.find((p) => p.id === appState.activeProjectId);
       if (p) {
         startWatchingProject(p.id, p.path);
-        await syncProjectToVectorStore(p.path);
       }
     }
     
@@ -83,5 +82,10 @@ export function setupAppLifecycle() {
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  });
+
+  app.on("will-quit", () => {
+    // Perform any final cleanup of DB connections if needed
+    console.log("[App] Quitting... cleaning up resources.");
   });
 }

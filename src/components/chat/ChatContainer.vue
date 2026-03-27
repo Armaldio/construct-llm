@@ -61,10 +61,7 @@ watch(
           v-if="
             store.isStreaming &&
             store.activeThread.messages[store.activeThread.messages.length - 1]?.role ===
-              'assistant' &&
-            (!store.activeThread.messages[store.activeThread.messages.length - 1].parts ||
-              store.activeThread.messages[store.activeThread.messages.length - 1].parts.length ===
-                0)
+              'assistant'
           "
           class="message-row assistant streaming"
         >
