@@ -70,7 +70,7 @@ export const C3EventItemBaseSchema = z.object({
       z.object({
         id: z.string(),
         objectClass: z.string(),
-        parameters: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
+        parameters: z.record(z.string(), z.any()).optional(),
       }),
     )
     .optional(),

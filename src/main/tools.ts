@@ -133,24 +133,34 @@ export const generate_c3_clipboard = {
     contextSnippets: z.string().optional(),
   }),
   execute: async ({ logic, objects, contextSnippets }: any) => {
-    try {
-      const config = lastUsedModelConfig || { provider: "mistral" };
-      const model = getDynamicModel(config);
-      const prompt = `Convert logic into C3 clipboard JSON. Objects: ${objects.join(", ")}. Logic: ${logic}`;
+    const maxRetries = 2;
+    let lastError = null;
 
-      const generator = new Agent({
-        id: "generator",
-        name: "Generator",
-        instructions: "Output ONLY valid JSON.",
-        model,
-      });
+    for (let i = 0; i <= maxRetries; i++) {
+      try {
+        const config = lastUsedModelConfig || { provider: "mistral" };
+        const model = getDynamicModel(config);
+        const prompt = `Convert logic into C3 clipboard JSON. Objects: ${objects.join(", ")}. Logic: ${logic}${i > 0 ? "\n\nIMPORTANT: Your previous attempt failed validation. Please ensure every parameter value is a simple string, number, or boolean." : ""}`;
 
-      const result = await generator.generate(prompt, {
-        structuredOutput: { schema: C3ClipboardSchema },
-      });
+        const generator = new Agent({
+          id: "generator",
+          name: "Generator",
+          instructions: "Output ONLY valid JSON.",
+          model,
+        });
 
-      return { "is-c3-clipboard-data": true, data: result.object };
-    } catch (e: any) { return `Error: ${e.message}`; }
+        const result = await generator.generate(prompt, {
+          structuredOutput: { schema: C3ClipboardSchema },
+          maxTokens: 4096, // Increase for complex logic
+        });
+
+        return { "is-c3-clipboard-data": true, data: result.object };
+      } catch (e: any) {
+        console.error(`[AI Tool] generate_c3_clipboard attempt ${i + 1} failed:`, e.message);
+        lastError = e;
+      }
+    }
+    return `Error after ${maxRetries + 1} attempts: ${lastError?.message}`;
   },
 };
 

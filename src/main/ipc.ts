@@ -226,27 +226,56 @@ export function setupIpcHandlers() {
         if (done) break;
 
         const chunkAny = chunk as any;
+        console.log(`[Stream Chunk] Type: ${chunkAny.type}`, JSON.stringify(chunkAny, null, 2));
 
-        // God Tier: Rich Reflections with Emojis
-        if (chunk.type === "tool-call") {
-          const name = chunkAny.payload?.toolName || "";
+        // God Tier: Rich Reflections with Emojis & Tool Alignment
+        if (chunkAny.type === "tool-call") {
+          const name = chunkAny.payload?.toolName || chunkAny.toolName || "";
+          const toolCallId = chunkAny.payload?.toolCallId || chunkAny.toolCallId || "";
+          const args = chunkAny.payload?.args || chunkAny.args || {};
+
           let label = `⚡ Thinking... (using ${name})`;
           if (name.includes("read_file")) label = `📂 Reading file...`;
           if (name.includes("search")) label = `🔍 Searching project...`;
-          
+
           console.log(`[AI Tool] Using: ${name}`);
-          
-          mainWindow?.webContents.send("agent-reflection", { type: "thought", content: label, transient: true });
-        } else if (chunk.type === "text-delta") {
-          const text = chunkAny.payload?.textDelta || chunkAny.textDelta || "";
+
+          mainWindow?.webContents.send("agent-reflection", {
+            type: "tool-call",
+            toolName: name,
+            toolCallId,
+            args,
+            content: label,
+          });
+        } else if (chunkAny.type === "tool-result") {
+          const name = chunkAny.payload?.toolName || chunkAny.toolName || "";
+          const toolCallId = chunkAny.payload?.toolCallId || chunkAny.toolCallId || "";
+          const resultRes = chunkAny.payload?.result || chunkAny.result || "";
+
+          console.log(`[AI Tool] Result from: ${name}`);
+
+          mainWindow?.webContents.send("agent-reflection", {
+            type: "tool-result",
+            toolName: name,
+            toolCallId: toolCallId,
+            result: resultRes,
+          });
+        } else if (chunkAny.type === "text-delta") {
+          const text = chunkAny.payload?.text || chunkAny.payload?.textDelta || chunkAny.text || "";
           mainWindow?.webContents.send("agent-chunk", { text });
-        } else if (chunkAny.type === "thought" || chunkAny.type === "reasoning") {
-          mainWindow?.webContents.send("agent-reflection", { type: "thought", content: chunkAny.payload?.text || chunkAny.text });
+        } else if (chunkAny.type === "thought" || chunkAny.type === "reasoning" || chunkAny.type === "thought-delta") {
+          const thought = chunkAny.payload?.text || chunkAny.payload?.textDelta || chunkAny.text || "";
+          mainWindow?.webContents.send("agent-reflection", { type: "thought", content: thought });
+        } else if (chunkAny.type === "error") {
+          const errorMsg = chunkAny.payload?.message || chunkAny.message || "Unknown error";
+          mainWindow?.webContents.send("agent-chunk", { text: `\n\n> ⚠️ **Error: ${errorMsg}**` });
         }
       }
 
       // God Tier: Token Usage & Cost Reflection
       const usage = await result.usage;
+      console.log(`[AI Query] Usage Metadata:`, JSON.stringify(usage, null, 2));
+
       if (usage) {
         promptTokens = (usage as any).promptTokens || 0;
         completionTokens = (usage as any).completionTokens || 0;
