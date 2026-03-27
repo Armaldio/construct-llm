@@ -141,11 +141,10 @@ const safeParsedC3 = (part: ChatMessagePart) => {
                     class="step-summary flex items-center gap-2 p-2 cursor-pointer hover:bg-gray-50"
                   >
                     <i
-                      :class="
-                        step.type === 'tool' || step.type === 'result'
-                          ? 'pi pi-cog spin-slow'
-                          : 'pi pi-search'
-                      "
+                      :class="[
+                        step.type === 'tool' && !step.result ? 'pi pi-cog spin-slow' : 'pi pi-cog',
+                        { 'text-green-500': step.result },
+                      ]"
                     ></i>
                     <span class="font-medium">{{ step.content }}</span>
                   </summary>
@@ -189,7 +188,7 @@ const safeParsedC3 = (part: ChatMessagePart) => {
         </div>
 
         <div
-          class="message-footer mt-2 flex justify-end opacity-0 group-hover:opacity-100 transition-opacity h-6"
+          class="message-footer absolute bottom-1 right-2 opacity-0 group-hover:opacity-100 transition-opacity"
         >
           <Button
             icon="pi pi-copy"
@@ -214,6 +213,7 @@ const safeParsedC3 = (part: ChatMessagePart) => {
 <style scoped>
 .message-bubble {
   padding: 0.25rem 0;
+  position: relative;
 }
 
 .assistant-content {

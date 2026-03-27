@@ -37,4 +37,7 @@ contextBridge.exposeInMainWorld("api", {
   sendEmbeddingResult: (data: { id: number; embeddings?: number[][]; error?: string }) => {
     ipcRenderer.send("embedding-result", data);
   },
+  onAgentStreamEnd: (callback: () => void) => {
+    ipcRenderer.on("agent-stream-end", (_event) => callback());
+  },
 });

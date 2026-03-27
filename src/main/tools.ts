@@ -213,11 +213,3 @@ export const get_object_schema = {
   },
 };
 
-export const record_thought = {
-  id: "record_thought",
-  description: "Record your internal reasoning or plan.",
-  inputSchema: z.object({ thought: z.string() }),
-  execute: async ({ thought }: { thought: string }) => {
-    return "Thought recorded.";
-  },
-};

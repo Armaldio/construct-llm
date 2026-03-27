@@ -12,7 +12,6 @@ export const AGENT_CONFIGS: Record<string, any> = {
       search_project: tools.search_project,
       list_project_files: tools.list_project_files,
       list_project_addons: tools.list_project_addons,
-      record_thought: tools.record_thought,
     },
   },
   "logic-expert-agent": {
@@ -22,7 +21,6 @@ export const AGENT_CONFIGS: Record<string, any> = {
       search_manual: tools.search_manual,
       get_object_schema: tools.get_object_schema,
       generate_c3_clipboard: tools.generate_c3_clipboard,
-      record_thought: tools.record_thought,
     },
   },
   "generator-agent": {
@@ -30,7 +28,6 @@ export const AGENT_CONFIGS: Record<string, any> = {
     tools: { 
       search_snippets: tools.search_snippets, 
       generate_c3_clipboard: tools.generate_c3_clipboard, 
-      record_thought: tools.record_thought 
     },
   },
   "construct-llm-agent": {
@@ -43,7 +40,6 @@ export const AGENT_CONFIGS: Record<string, any> = {
       list_project_addons: tools.list_project_addons,
       list_project_files: tools.list_project_files,
       get_object_schema: tools.get_object_schema,
-      record_thought: tools.record_thought,
     },
   },
 };

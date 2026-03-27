@@ -268,7 +268,10 @@ export function setupIpcHandlers() {
           mainWindow?.webContents.send("agent-reflection", { type: "thought", content: thought });
         } else if (chunkAny.type === "error") {
           const errorMsg = chunkAny.payload?.message || chunkAny.message || "Unknown error";
-          mainWindow?.webContents.send("agent-chunk", { text: `\n\n> ⚠️ **Error: ${errorMsg}**` });
+          const details = chunkAny.payload?.details ? `\n\n**Details:** ${JSON.stringify(chunkAny.payload.details, null, 2)}` : "";
+          mainWindow?.webContents.send("agent-chunk", {
+            text: `\n\n> ⚠️ **Error:** ${errorMsg}${details}`,
+          });
         }
       }
 
@@ -293,8 +296,12 @@ export function setupIpcHandlers() {
 
       return "Done";
     } catch (error: any) {
-      console.error("[DEBUG] Error:", error);
-      mainWindow?.webContents.send("agent-chunk", { text: `\n\n> ⚠️ **Error: ${error.message}**` });
+      console.error("[AI Query] Fatal Error:", error);
+      const explanation = error.message || "No explanation provided.";
+      const cause = error.cause ? `\n\n**Cause:** ${error.cause}` : "";
+      mainWindow?.webContents.send("agent-chunk", {
+        text: `\n\n> ⚠️ **Fatal AI Error:** ${explanation}${cause}`,
+      });
       return `Error: ${error.message}`;
     }
   });
