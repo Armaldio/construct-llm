@@ -23,7 +23,7 @@ This project is an Electron-based desktop application acting as a Retrieval-Augm
 
 - **Vue 3:** Exclusively use the Composition API with `<script setup>`. Avoid the Options API.
 - **PrimeVue:** Utilize PrimeVue components for a consistent and accessible UI. Adhere to their styling and theming guidelines.
-- **TypeScript:** Enforce strict typing. Avoid `any`. Define clear interfaces for IPC payloads, Construct 3 project structures, and Mastra.ai interactions.
+- **TypeScript:** Enforce strict typing. **ZERO TOLERANCE for the `any` type.** You MUST ensure type correctness by defining clear interfaces for IPC payloads, Construct 3 project structures, AI SDK streams, and Mastra.ai interactions. If a type is unknown, use `unknown` and perform type narrowing/checking.
 - **Electron IPC:**
   - Maintain a strict separation of concerns between the Main process and the Renderer process.
   - All heavy lifting, file system operations, and Mastra.ai interactions MUST occur in the Main process.
@@ -33,3 +33,4 @@ This project is an Electron-based desktop application acting as a Retrieval-Augm
 - ALWAYS use Context7 MCP when you need up-to-date documentation or examples for external libraries and frameworks.
 - ALWAYS format your code after making edits using `npm run format`.
 - Do not attempt to start the app yourself or run typechecking or run lint
+- **NEVER** edit files using `cat` redirection (e.g., `cat << EOF > file.ts`). It doesn't work well and causes issues. Always use the built-in `write_file` or `replace` tools.

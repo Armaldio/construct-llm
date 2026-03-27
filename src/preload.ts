@@ -3,27 +3,29 @@ import { contextBridge, ipcRenderer } from "electron";
 
 contextBridge.exposeInMainWorld("api", {
   getAppState: () => ipcRenderer.invoke("get-app-state"),
-  updateAppState: (state: any) => ipcRenderer.invoke("update-app-state", state),
+  updateAppState: (state: unknown) => ipcRenderer.invoke("update-app-state", state),
   isStartupComplete: () => ipcRenderer.invoke("is-startup-complete"),
   selectProject: () => ipcRenderer.invoke("select-project"),
   deleteProject: (id: string) => ipcRenderer.invoke("delete-project", id),
   forceReindex: () => ipcRenderer.invoke("force-reindex"),
-  saveApiKeys: (keys: any) => ipcRenderer.invoke("save-api-keys", keys),
+  saveApiKeys: (keys: Record<string, string>) => ipcRenderer.invoke("save-api-keys", keys),
   getProjectTree: () => ipcRenderer.invoke("get-project-tree"),
   getFileContent: (path: string) => ipcRenderer.invoke("get-file-content", path),
-  askQuestion: (data: { text: string; threadId: string; modelConfig: any; agentId: string }) =>
+  askQuestion: (data: { text: string; threadId: string; modelConfig: unknown; agentId: string }) =>
     ipcRenderer.invoke("ask-question", data),
+  generateTitle: (data: { userMessage: string; assistantResponse: string; modelConfig: unknown }) =>
+    ipcRenderer.invoke("generate-title", data),
 
-  onIndexingStatus: (callback: (data: any) => void) => {
+  onIndexingStatus: (callback: (data: unknown) => void) => {
     ipcRenderer.on("indexing-status", (_event, data) => callback(data));
   },
-  onAgentReflection: (callback: (data: any) => void) => {
+  onAgentReflection: (callback: (data: unknown) => void) => {
     ipcRenderer.on("agent-reflection", (_event, data) => callback(data));
   },
-  onAgentChunk: (callback: (chunk: string) => void) => {
-    ipcRenderer.on("agent-chunk", (_event, chunk) => callback(chunk));
+  onAgentChunk: (callback: (chunk: string | { text: string; metadata?: unknown }) => void) => {
+    ipcRenderer.on("agent-chunk", (_event, chunk) => callback(chunk as any)); // callback expects string in some places, object in others. using cast for bridge compatibility
   },
-  onStartupProgress: (callback: (data: any) => void) => {
+  onStartupProgress: (callback: (data: unknown) => void) => {
     ipcRenderer.on("startup-progress", (_event, data) => callback(data));
   },
   onStartupComplete: (callback: () => void) => {

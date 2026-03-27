@@ -50,38 +50,66 @@ const formatParams = (params: any) => {
 };
 
 const items = computed(() => {
-  if (props.data && props.data.items) return props.data.items;
+  if (!props.data) return [];
+  if (props.data.items && Array.isArray(props.data.items)) return props.data.items;
   if (Array.isArray(props.data)) return props.data;
+  // If it's a single item not in an array, wrap it
+  if (props.data.eventType) return [props.data];
   return [];
 });
 </script>
 
 <template>
-  <div class="c3-event-sheet">
+  <div class="c3-event-sheet p-2">
+    <div
+      v-if="items.length === 0"
+      class="p-6 text-center text-gray-500 italic bg-gray-50 rounded border-2 border-dashed border-gray-200"
+    >
+      <div class="mb-2"><i class="pi pi-exclamation-circle text-2xl"></i></div>
+      No renderable Construct 3 events found.
+      <div class="text-[10px] mt-2 font-mono text-gray-400 overflow-hidden text-ellipsis">
+        {{ JSON.stringify(props.data).substring(0, 100) }}...
+      </div>
+    </div>
     <template v-for="(item, index) in items" :key="index">
       <!-- Event Block -->
-      <div v-if="item.eventType === 'block'" class="c3-block">
-        <div class="c3-event-row">
+      <div v-if="item.eventType === 'block'" class="c3-block shadow-sm mb-1">
+        <div class="c3-event-row flex border-b border-gray-100 last:border-0">
           <!-- Conditions Column -->
-          <div class="c3-conditions">
-            <div v-for="(cond, cIdx) in item.conditions" :key="cIdx" class="c3-condition">
-              <span class="c3-object">{{ cond.objectClass }}</span>
-              <span class="c3-id">{{ formatId(cond.id) }}</span>
-              <span class="c3-params">{{ formatParams(cond.parameters) }}</span>
+          <div
+            class="c3-conditions flex-1 border-r border-gray-100 p-2 min-w-[150px] bg-gray-50/50"
+          >
+            <div
+              v-if="!item.conditions || item.conditions.length === 0"
+              class="text-gray-400 italic text-[10px]"
+            >
+              No conditions
+            </div>
+            <div v-for="(cond, cIdx) in item.conditions" :key="cIdx" class="c3-condition mb-1">
+              <span class="c3-object font-bold text-blue-600 mr-1">{{ cond.objectClass }}</span>
+              <span class="c3-id text-gray-800">{{ formatId(cond.id) }}</span>
+              <span class="c3-params text-gray-500 italic text-[10px] ml-1">{{
+                formatParams(cond.parameters)
+              }}</span>
             </div>
           </div>
 
           <!-- Actions Column -->
-          <div class="c3-actions">
-            <div v-for="(act, aIdx) in item.actions" :key="aIdx" class="c3-action">
-              <span class="c3-object">{{ act.objectClass }}</span>
-              <span class="c3-id">{{
+          <div class="c3-actions flex-[1.5] p-2 bg-white">
+            <div
+              v-if="!item.actions || item.actions.length === 0"
+              class="text-gray-400 italic text-[10px]"
+            >
+              No actions
+            </div>
+            <div v-for="(act, aIdx) in item.actions" :key="aIdx" class="c3-action mb-1">
+              <span class="c3-object font-bold text-green-600 mr-1">{{ act.objectClass }}</span>
+              <span class="c3-id text-gray-800">{{
                 act.callFunction ? `Call ${act.callFunction}` : formatId(act.id)
               }}</span>
-              <span class="c3-params">{{ formatParams(act.parameters) }}</span>
-            </div>
-            <div v-if="!item.actions || item.actions.length === 0" class="c3-no-actions">
-              &nbsp;
+              <span class="c3-params text-gray-500 italic text-[10px] ml-1">{{
+                formatParams(act.parameters)
+              }}</span>
             </div>
           </div>
         </div>
