@@ -66,6 +66,7 @@ export const architectAgent = new Agent({
     return inst;
   },
   memory: getAgentMemory,
+  workspace: getCurrentWorkspace,
   tools: ({ requestContext }: any) => {
     const baseTools = AGENT_CONFIGS["architect-agent"].tools;
     const ws = getCurrentWorkspace();
@@ -88,6 +89,7 @@ export const logicExpertAgent = new Agent({
     return inst;
   },
   memory: getAgentMemory,
+  workspace: getCurrentWorkspace,
   tools: ({ requestContext }: any) => {
     const baseTools = AGENT_CONFIGS["logic-expert-agent"].tools;
     const ws = getCurrentWorkspace();
@@ -110,6 +112,7 @@ export const generatorAgent = new Agent({
     return inst;
   },
   memory: getAgentMemory,
+  workspace: getCurrentWorkspace,
   tools: ({ requestContext }: any) => {
     const baseTools = AGENT_CONFIGS["generator-agent"].tools;
     const ws = getCurrentWorkspace();
@@ -132,6 +135,7 @@ export const constructExpertAgent = new Agent({
     return inst;
   },
   memory: getAgentMemory,
+  workspace: getCurrentWorkspace,
   tools: ({ requestContext }: any) => {
     const baseTools = AGENT_CONFIGS["construct-llm-agent"].tools;
     const ws = getCurrentWorkspace();

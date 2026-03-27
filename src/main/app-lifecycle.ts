@@ -8,7 +8,7 @@ import {
   globalStore,
 } from "./mastra";
 import { appState, loadState } from "./state";
-import { syncProjectToVectorStore, sleep } from "./utils";
+import { startWatchingProject, syncProjectToVectorStore, sleep } from "./utils";
 import { setupIpcHandlers } from "./ipc";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -66,6 +66,7 @@ export function setupAppLifecycle() {
     if (appState.activeProjectId) {
       const p = appState.projects.find((p) => p.id === appState.activeProjectId);
       if (p) {
+        startWatchingProject(p.id, p.path);
         await syncProjectToVectorStore(p.path);
       }
     }

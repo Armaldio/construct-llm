@@ -28,15 +28,18 @@ export const search_project = {
   }),
   execute: async ({ queryText }: { queryText: string }) => {
     const sanitizedQuery = queryText.replace(/^[#@]/, "");
-    const activeProject = appState.projects.find(p => p.id === appState.activeProjectId);
+    const activeProject = appState.projects.find((p) => p.id === appState.activeProjectId);
+    if (!activeProject?.path) return "No project loaded.";
+
     try {
+      // 1. Semantic Search
       const { embeddings } = await embeddingModel.doEmbed({ values: [sanitizedQuery] });
       const queryVector = embeddings[0];
 
       const results = await getProjectStore().query({
         indexName: "project_content",
         queryVector,
-        topK: 3,
+        topK: 10, // Increased for better coverage
       });
 
       let response = "";
@@ -53,22 +56,46 @@ export const search_project = {
             .join("\n\n");
       }
 
-      if (activeProject?.path) {
-        const allFiles = await getAllFiles(activeProject.path);
-        const exactMatches = [];
-        for (const file of allFiles) {
-          const content = await fs.readFile(file, "utf8");
-          if (content.toLowerCase().includes(sanitizedQuery.toLowerCase())) {
-            exactMatches.push(path.relative(activeProject.path, file));
-          }
-        }
+      // 2. Exact Match & Keyword Fallback
+      const allFiles = await getAllFiles(activeProject.path);
+      const exactMatches = [];
+      const keywordMatches: Record<string, string[]> = {};
 
-        if (exactMatches.length > 0) {
-          response += "\n\n### Exact Text Matches Found In ###\n" + exactMatches.join("\n");
+      const words = sanitizedQuery
+        .split(/\s+/)
+        .filter((w) => w.length > 3)
+        .map((w) => w.toLowerCase());
+
+      for (const file of allFiles) {
+        const content = await fs.readFile(file, "utf8");
+        const lowerContent = content.toLowerCase();
+        const relPath = path.relative(activeProject.path, file).replace(/\\/g, "/");
+
+        if (lowerContent.includes(sanitizedQuery.toLowerCase())) {
+          exactMatches.push(relPath);
+        } else {
+          for (const word of words) {
+            if (lowerContent.includes(word)) {
+              if (!keywordMatches[word]) keywordMatches[word] = [];
+              if (keywordMatches[word].length < 5) keywordMatches[word].push(relPath);
+            }
+          }
         }
       }
 
-      if (!response) return "No relevant project context found.";
+      if (exactMatches.length > 0) {
+        response += "\n\n### Exact Text Matches Found In ###\n" + exactMatches.join("\n");
+      }
+
+      const foundKeywords = Object.keys(keywordMatches);
+      if (foundKeywords.length > 0 && !response) {
+        response += "\n\n### Keyword Matches Found In ###\n";
+        for (const kw of foundKeywords) {
+          response += `Keyword "${kw}": ${keywordMatches[kw].join(", ")}\n`;
+        }
+      }
+
+      if (!response) return "No relevant project context found. Try searching for specific object names or shorter keywords.";
 
       return response;
     } catch (e: any) {
@@ -257,21 +284,45 @@ export const get_object_schema = {
     objectName: z.string().describe("Object type name."),
   }),
   execute: async ({ objectName }: { objectName: string }) => {
-    const activeProject = appState.projects.find(p => p.id === appState.activeProjectId);
-    if (!activeProject?.path) return "No project.";
+    const activeProject = appState.projects.find((p) => p.id === appState.activeProjectId);
+    if (!activeProject?.path) return "No project loaded.";
+
     const sanitizedName = objectName.replace(/^[#@]/, "");
+    const lowerName = sanitizedName.toLowerCase();
+
     try {
-      const dirPath = path.join(activeProject.path, "objectTypes");
-      const files = await getAllFiles(dirPath);
-      const targetPath = files.find(
-        (f) => path.basename(f).toLowerCase() === `${sanitizedName.toLowerCase()}.json`,
-      );
+      // 1. Recursive project-wide search for filename match
+      const allFiles = await getAllFiles(activeProject.path);
+
+      // Priority 1: Exact filename match (with or without .json)
+      let targetPath = allFiles.find((f) => {
+        const base = path.basename(f).toLowerCase();
+        return base === `${lowerName}.json` || base === lowerName;
+      });
+
+      // Priority 2: Full path contains the name (to handle nested objects correctly)
+      if (!targetPath) {
+        targetPath = allFiles.find((f) => {
+          const rel = path.relative(activeProject.path, f).toLowerCase();
+          return rel.includes(`/${lowerName}.json`) || rel.startsWith(`${lowerName}.json`);
+        });
+      }
+
+      // Priority 3: Fuzzy filename match (starts with or includes)
+      if (!targetPath) {
+        targetPath = allFiles.find((f) => {
+          const base = path.basename(f).toLowerCase();
+          return base.startsWith(lowerName) || base.includes(lowerName);
+        });
+      }
+
       if (targetPath) {
         return await fs.readFile(targetPath, "utf8");
       }
-      return "Not found.";
+
+      return `Object or Family "${sanitizedName}" not found. Try listing files in 'objectTypes' or 'families' to find the exact name.`;
     } catch (e) {
-      return "Not found.";
+      return "Error searching for object schema.";
     }
   },
 };

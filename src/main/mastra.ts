@@ -20,7 +20,7 @@ export const memoryStore = new LibSQLStore({
 
 export let projectStore: LibSQLVector | undefined;
 export let agentMemory: Memory | undefined;
-export let currentWorkspace: Workspace | null = null;
+export let currentWorkspace: Workspace | undefined;
 
 export function getProjectStore() {
   if (!projectStore) {
@@ -44,7 +44,7 @@ export function setAgentMemory(memory: Memory) {
   agentMemory = memory;
 }
 
-export function setCurrentWorkspace(workspace: Workspace | null) {
+export function setCurrentWorkspace(workspace: Workspace | undefined) {
   currentWorkspace = workspace;
 }
 
