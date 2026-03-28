@@ -4,10 +4,14 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { pipeline } from "@xenova/transformers";
 import { PDFParse } from "pdf-parse";
+import { execSync } from "node:child_process";
 
 interface EmbedderResult {
   embeddings: number[][];
 }
+
+const SCIRRA_EXAMPLES_URL = "https://github.com/Scirra/Construct-Example-Projects.git";
+const TEMP_DIR = path.resolve(process.cwd(), "temp_projects");
 
 // Setup Xenova local embedder wrapper
 class XenovaEmbedder {
@@ -48,15 +52,39 @@ const vectorStore = new LibSQLVector({
   url: "file:prebuilt-assets.db",
 });
 
+async function getAllFiles(dirPath: string, arrayOfFiles: string[] = []) {
+  try {
+    const files = await fs.readdir(dirPath);
+
+    for (const file of files) {
+      const filePath = path.join(dirPath, file);
+      const stat = await fs.stat(filePath);
+
+      if (stat.isDirectory()) {
+        await getAllFiles(filePath, arrayOfFiles);
+      } else {
+        const ext = path.extname(file).toLowerCase();
+        if ([".json", ".js"].includes(ext)) {
+          arrayOfFiles.push(filePath);
+        }
+      }
+    }
+  } catch (e) {
+    // Directory might not exist
+  }
+
+  return arrayOfFiles;
+}
+
 async function main() {
-  console.log("Starting pre-indexing of global assets...");
+  console.log("Starting simplified pre-indexing of Scirra Example Projects...");
   const vStore = vectorStore;
 
   try {
     await vStore.createIndex({ indexName: "manual_content", dimension: 384 });
     await vStore.createIndex({ indexName: "snippet_content", dimension: 384 });
   } catch (e) {
-    // Indexes might already exist, ignore error
+    // Index might already exist
   }
 
   const processAndUpsert = async (
@@ -75,7 +103,7 @@ async function main() {
         if (res && res.embeddings && res.embeddings[0]) {
           const embeddingArray = Array.from(res.embeddings[0]);
           vectors.push(embeddingArray);
-          ids.push(`global-${prefix}-chunk-${i}`.replace(/[^a-zA-Z0-9-]/g, "_"));
+          ids.push(`scirra-${prefix}-chunk-${i}`.replace(/[^a-zA-Z0-9-]/g, "_"));
           metadata.push(chunk.metadata);
         }
       } catch (err) {
@@ -83,95 +111,98 @@ async function main() {
       }
     }
     if (vectors.length > 0) {
+      console.log(`Upserting ${vectors.length} vectors for ${prefix}...`);
       await vStore.upsert({ indexName, vectors, ids, metadata });
     }
   };
 
-  // 1. Manual
-  const pdfPath = path.join(process.cwd(), "assets", "construct-3.pdf");
+  // 1. Prepare Temp Directory
+  await fs.mkdir(TEMP_DIR, { recursive: true });
+
+  // 2. Clone Scirra Repo
+  const repoName = "Construct-Example-Projects";
+  const targetPath = path.join(TEMP_DIR, repoName);
+
   try {
-    const dataBuffer = await fs.readFile(pdfPath);
-    const parser = new PDFParse({ data: dataBuffer });
-    const result = await parser.getText();
-    const cleanedText = result.text.replace(
-      /Construct 3 Official Manual\s+Page \d+ of \d+\s+-- \d+ of \d+ --/g,
-      "",
-    );
-
-    // Split into sections using the "View online:" pattern
-    const sectionRegex =
-      /([A-Z0-9\s\n&]{3,})\nView online: (https:\/\/www\.construct\.net\/[^\s]+)/g;
-
-    let lastIndex = 0;
-    let match;
-    const sections: { title: string; url: string; content: string }[] = [];
-
-    while ((match = sectionRegex.exec(cleanedText)) !== null) {
-      if (sections.length > 0) {
-        sections[sections.length - 1].content = cleanedText
-          .substring(lastIndex, match.index)
-          .trim();
-      }
-      sections.push({
-        title: match[1].trim().replace(/\n/g, " "),
-        url: match[2],
-        content: "",
-      });
-      lastIndex = match.index + match[0].length;
+    console.log(`Cloning ${SCIRRA_EXAMPLES_URL} into ${targetPath}...`);
+    if (await fs.stat(targetPath).catch(() => null)) {
+      console.log(`Repo ${repoName} already exists, skipping clone.`);
+    } else {
+      execSync(`git clone ${SCIRRA_EXAMPLES_URL} ${targetPath}`, { stdio: "inherit" });
     }
-
-    if (sections.length > 0) {
-      sections[sections.length - 1].content = cleanedText.substring(lastIndex).trim();
-    }
-
-    console.log(`Found ${sections.length} manual sections. Processing...`);
-
-    for (const section of sections) {
-      if (!section.content || section.content.length < 50) continue;
-
-      const doc = MDocument.fromText(section.content, {
-        metadata: {
-          title: section.title,
-          url: section.url,
-          path: "assets/construct-3.pdf",
-          type: "manual",
-        },
-      });
-
-      const docChunks = await doc.chunk({ strategy: "recursive", maxSize: 800, overlap: 150 });
-
-      await processAndUpsert(
-        docChunks.map((c) => ({
-          text: `### ${section.title}\nSource: ${section.url}\n\n${c.text}`,
-          metadata: {
-            text: c.text,
-            title: section.title,
-            url: section.url,
-            path: "assets/construct-3.pdf",
-            type: "manual",
-          },
-        })),
-        `manual-${section.title.replace(/[^a-zA-Z0-9]/g, "-")}`,
-        "manual_content",
-      );
-    }
-  } catch (pdfError) {
-    console.error("Failed to process manual PDF:", pdfError);
+  } catch (e: any) {
+    console.error(`Failed to clone remote project:`, e.message);
+    return;
   }
 
-  // 2. Snippets
-  const snippetsDir = path.join(process.cwd(), "snippets");
-  const files = await fs.readdir(snippetsDir);
-  for (const file of files) {
-    if (!file.endsWith(".json")) continue;
-    const content = await fs.readFile(path.join(snippetsDir, file), "utf8");
-    const text = `Snippet: ${file}\nDescription: Example of valid Construct 3 JSON.\nContent:\n${content}`;
-    console.log(`Processing snippet ${file}`);
-    await processAndUpsert(
-      [{ text, metadata: { text, path: `snippets/${file}`, type: "snippet" } }],
-      `snippet-${file}`,
-      "snippet_content",
-    );
+  // 3. Recursive Project Discovery
+  const allProjectRoots: string[] = [];
+
+  async function findProjectRoots(dir: string) {
+    const files = await fs.readdir(dir);
+    if (files.includes("project.c3proj")) {
+      allProjectRoots.push(dir);
+      return; // Found a project, don't go deeper into this one's subfolders
+    }
+    for (const file of files) {
+      const fullPath = path.join(dir, file);
+      if (file === ".git") continue;
+      if ((await fs.stat(fullPath)).isDirectory()) {
+        await findProjectRoots(fullPath);
+      }
+    }
+  }
+
+  await findProjectRoots(targetPath);
+  console.log(`Found ${allProjectRoots.length} projects to index.`);
+
+  // 4. Index Projects
+  for (const resolvedPath of allProjectRoots) {
+    try {
+      const projectName = path.basename(resolvedPath);
+      console.log(`Indexing project: ${projectName} at ${resolvedPath}`);
+
+      const allFiles = await getAllFiles(resolvedPath);
+      for (const file of allFiles) {
+        const relativePath = path.relative(resolvedPath, file).replace(/\\/g, "/");
+
+        // Skip uistate files and other noise
+        if (relativePath.includes(".uistate.json")) continue;
+        if (relativePath.includes(".git")) continue;
+
+        const content = await fs.readFile(file, "utf8");
+        const fileType = relativePath.split("/")[0] || "root";
+
+        const textToEmbed = `Project: ${projectName}\nFile: ${relativePath}\nType: ${fileType}\nContent:\n${content}`;
+
+        // Chunk if text is too large
+        const doc = MDocument.fromText(textToEmbed, {
+          metadata: {
+            text: textToEmbed,
+            project: projectName,
+            path: relativePath,
+            type: "project-file",
+            fileType: fileType
+          }
+        });
+
+        const chunks = await doc.chunk({ strategy: "recursive", maxSize: 2000, overlap: 200 });
+
+        await processAndUpsert(
+          chunks.map(c => ({
+            text: c.text,
+            metadata: {
+              ...c.metadata,
+              text: c.text // Ensure text is in metadata for retrieval
+            }
+          })),
+          `${projectName}-${relativePath.replace(/[^a-zA-Z0-9]/g, "-")}`,
+          "snippet_content"
+        );
+      }
+    } catch (e: any) {
+      console.error(`Failed to index project ${resolvedPath}:`, e.message);
+    }
   }
 
   console.log("Pre-indexing complete! Generated prebuilt-assets.db");

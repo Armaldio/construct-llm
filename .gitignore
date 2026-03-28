@@ -94,3 +94,4 @@ out/
 examples
 *.db*
 assets/construct-3.pdf
+temp_projects/
