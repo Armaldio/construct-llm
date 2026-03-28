@@ -49,10 +49,13 @@ export interface ProjectBrain {
   objects: Set<string>;
   families: Set<string>;
   globalVariables: Set<string>;
-  eventSheets: Record<string, {
-    variables: string[];
-    objectsReferenced: string[];
-  }>;
+  eventSheets: Record<
+    string,
+    {
+      variables: string[];
+      objectsReferenced: string[];
+    }
+  >;
 }
 
 export let projectBrain: ProjectBrain = {
@@ -116,7 +119,9 @@ export async function buildProjectBrain(projectPath: string) {
     extractNames(projData.families, brain.families);
 
     projectBrain = brain;
-    console.log(`[Brain] Scan complete. Found ${brain.objects.size} objects, ${brain.families.size} families.`);
+    console.log(
+      `[Brain] Scan complete. Found ${brain.objects.size} objects, ${brain.families.size} families.`,
+    );
   } catch (e: any) {
     console.error("[Brain] Error building project brain:", e.message);
   }
@@ -168,7 +173,7 @@ export function updateWorkspace(projectPath: string, projectId: string) {
 export function startWatchingProject(projectId: string, projectPath: string) {
   updateWorkspace(projectPath, projectId);
   buildProjectBrain(projectPath); // God Tier: Initial scan on load
-  
+
   if (projectWatcher) projectWatcher.close();
   projectWatcher = watch([path.join(projectPath, "**/*.json")], {
     persistent: true,

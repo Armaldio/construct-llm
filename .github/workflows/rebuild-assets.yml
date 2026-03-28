@@ -1,0 +1,57 @@
+name: Rebuild Pre-indexed Assets
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "examples/**"
+      - "scripts/pre-index.ts"
+      - "assets/**"
+  workflow_dispatch:
+
+jobs:
+  build-and-package:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Linux Dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fakeroot rpm
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build Vector Index
+        run: npm run pre-index
+        env:
+          NODE_OPTIONS: "--max-old-space-size=4096"
+
+      - name: Package Application (Make)
+        run: npm run make
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ matrix.os }}
+          path: out/make/**/*
+          retention-days: 7

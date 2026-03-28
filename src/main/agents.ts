@@ -25,9 +25,9 @@ export const AGENT_CONFIGS: Record<string, any> = {
   },
   "generator-agent": {
     ...AGENT_METADATA["generator-agent"],
-    tools: { 
-      search_snippets: tools.search_snippets, 
-      generate_c3_clipboard: tools.generate_c3_clipboard, 
+    tools: {
+      search_snippets: tools.search_snippets,
+      generate_c3_clipboard: tools.generate_c3_clipboard,
     },
   },
   "construct-llm-agent": {

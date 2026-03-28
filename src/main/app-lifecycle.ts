@@ -2,11 +2,7 @@ import { app, BrowserWindow, ipcMain } from "electron";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import {
-  setGlobalMainWindow,
-  getGlobalMainWindow,
-  globalStore,
-} from "./mastra";
+import { setGlobalMainWindow, getGlobalMainWindow, globalStore } from "./mastra";
 import { appState, loadState } from "./state";
 import { startWatchingProject, sleep } from "./utils";
 import { setupIpcHandlers } from "./ipc";
@@ -69,7 +65,7 @@ export function setupAppLifecycle() {
         startWatchingProject(p.id, p.path);
       }
     }
-    
+
     isStartupComplete = true;
     if (mainWindow) {
       mainWindow.webContents.send("startup-complete");

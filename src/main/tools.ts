@@ -2,11 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import { Agent } from "@mastra/core/agent";
-import {
-  embeddingModel,
-  globalStore,
-  getCurrentWorkspace,
-} from "./mastra";
+import { embeddingModel, globalStore, getCurrentWorkspace } from "./mastra";
 import { getAllFiles, projectBrain } from "./utils";
 import { C3ClipboardSchema, ModelConfig } from "./types";
 import { getDynamicModel } from "./config";
@@ -30,7 +26,7 @@ export const search_project = {
     if (!activeProject?.path) return "No project loaded.";
 
     const sanitizedQuery = queryText.replace(/^[#@]/, "").toLowerCase();
-    
+
     // 1. Check the Project Brain for instant structural hits
     if (projectBrain.objects.has(queryText) || projectBrain.families.has(queryText)) {
       console.log(`[Search] Brain hit for ${queryText}`);
@@ -56,7 +52,9 @@ export const search_project = {
               if (nameMatch) structuralContext = ` (Found in: ${nameMatch[1]})`;
             }
 
-            const snippet = lines.slice(Math.max(0, i - 2), Math.min(lines.length, i + 3)).join("\n");
+            const snippet = lines
+              .slice(Math.max(0, i - 2), Math.min(lines.length, i + 3))
+              .join("\n");
             results.push({
               file: path.relative(activeProject.path, file).replace(/\\/g, "/"),
               context: `${snippet}${structuralContext}`,
@@ -73,12 +71,7 @@ export const search_project = {
         return `No matches found for "${queryText}". Try a shorter keyword or a fuzzy synonym.`;
       }
 
-      return results
-        .map(
-          (r) =>
-            `--- ${r.file} (Line ${r.line}) ---\n${r.context}`,
-        )
-        .join("\n\n");
+      return results.map((r) => `--- ${r.file} (Line ${r.line}) ---\n${r.context}`).join("\n\n");
     } catch (e: any) {
       console.error("[DEBUG] Error in search_project tool:", e.message);
       return `Error searching project: ${e.message}`;
@@ -100,8 +93,12 @@ export const search_manual = {
       });
 
       if (results.length === 0) return "No manual entries found.";
-      return results.map((r: any) => `--- ${r.metadata?.title} ---\n${r.metadata?.text}`).join("\n\n");
-    } catch (e: any) { return `Error: ${e.message}`; }
+      return results
+        .map((r: any) => `--- ${r.metadata?.title} ---\n${r.metadata?.text}`)
+        .join("\n\n");
+    } catch (e: any) {
+      return `Error: ${e.message}`;
+    }
   },
 };
 
@@ -120,13 +117,16 @@ export const search_snippets = {
 
       if (results.length === 0) return "No snippets found.";
       return results.map((r: any) => `--- Snippet --- \n${r.metadata?.text}`).join("\n\n");
-    } catch (e: any) { return `Error: ${e.message}`; }
+    } catch (e: any) {
+      return `Error: ${e.message}`;
+    }
   },
 };
 
 export const generate_c3_clipboard = {
   id: "generate_c3_clipboard",
-  description: "Generate Construct 3 clipboard JSON from logic. DO NOT repeat JSON in chat response.",
+  description:
+    "Generate Construct 3 clipboard JSON from logic. DO NOT repeat JSON in chat response.",
   inputSchema: z.object({
     logic: z.string(),
     objects: z.array(z.string()),
@@ -169,7 +169,7 @@ export const list_project_addons = {
   description: "List plugins and behaviors.",
   inputSchema: z.object({}),
   execute: async () => {
-    const activeProject = appState.projects.find(p => p.id === appState.activeProjectId);
+    const activeProject = appState.projects.find((p) => p.id === appState.activeProjectId);
     if (!activeProject?.path) return "No project.";
     const content = await fs.readFile(path.join(activeProject.path, "project.c3proj"), "utf8");
     const data = JSON.parse(content);
@@ -182,12 +182,14 @@ export const list_project_files = {
   description: "List files in directory.",
   inputSchema: z.object({ directory: z.string() }),
   execute: async ({ directory }: any) => {
-    const activeProject = appState.projects.find(p => p.id === appState.activeProjectId);
+    const activeProject = appState.projects.find((p) => p.id === appState.activeProjectId);
     const dirPath = path.join(activeProject!.path, directory);
     try {
       const files = await getAllFiles(dirPath);
       return JSON.stringify(files.map((f) => path.relative(dirPath, f)));
-    } catch (e) { return "Not found."; }
+    } catch (e) {
+      return "Not found.";
+    }
   },
 };
 
@@ -196,14 +198,14 @@ export const get_object_schema = {
   description: "Returns JSON schema for an object or family.",
   inputSchema: z.object({ objectName: z.string() }),
   execute: async ({ objectName }: { objectName: string }) => {
-    const activeProject = appState.projects.find(p => p.id === appState.activeProjectId);
+    const activeProject = appState.projects.find((p) => p.id === appState.activeProjectId);
     if (!activeProject?.path) return "No project.";
 
     const lowerName = objectName.toLowerCase();
     const allFiles = await getAllFiles(activeProject.path);
 
     // Filter to find the file
-    const target = allFiles.find(f => {
+    const target = allFiles.find((f) => {
       const base = path.basename(f, ".json").toLowerCase();
       return base === lowerName;
     });
@@ -212,4 +214,3 @@ export const get_object_schema = {
     return `Asset "${objectName}" not found. Try searching for it or listing families.`;
   },
 };
-

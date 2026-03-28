@@ -4,20 +4,9 @@ import fs from "node:fs/promises";
 import { RequestContext } from "@mastra/core/request-context";
 import { generateText } from "ai";
 
-import {
-  appState,
-  encryptedApiKeys,
-  saveState,
-  saveKeys,
-  setAppState,
-} from "./state";
-import {
-  getGlobalMainWindow,
-  pendingEmbeddings,
-} from "./mastra";
-import {
-  startWatchingProject,
-} from "./utils";
+import { appState, encryptedApiKeys, saveState, saveKeys, setAppState } from "./state";
+import { getGlobalMainWindow, pendingEmbeddings } from "./mastra";
+import { startWatchingProject } from "./utils";
 import { AGENTS_MAP } from "./agents";
 import { setLastUsedModelConfig } from "./tools";
 import { ModelConfig } from "./types";
@@ -89,14 +78,15 @@ export function setupIpcHandlers() {
         appState.activeProjectId = id;
         await saveState();
       }
-      if (projectPath && appState.activeProjectId) startWatchingProject(appState.activeProjectId, projectPath);
+      if (projectPath && appState.activeProjectId)
+        startWatchingProject(appState.activeProjectId, projectPath);
       return p;
     }
     return null;
   });
 
   ipcMain.handle("get-project-tree", async () => {
-    const project = appState.projects.find(p => p.id === appState.activeProjectId);
+    const project = appState.projects.find((p) => p.id === appState.activeProjectId);
     if (!project?.path) return [];
 
     const buildTree = async (dir: string, relPath = ""): Promise<any[]> => {
@@ -158,7 +148,7 @@ export function setupIpcHandlers() {
   });
 
   ipcMain.handle("get-file-content", async (_, relPath) => {
-    const project = appState.projects.find(p => p.id === appState.activeProjectId);
+    const project = appState.projects.find((p) => p.id === appState.activeProjectId);
     if (!project?.path) return "";
     return await fs.readFile(path.join(project.path, relPath), "utf8");
   });
@@ -198,9 +188,9 @@ export function setupIpcHandlers() {
       const targetAgentId = agentId && agentId !== "auto" ? agentId : "construct-llm-agent";
       const provider = modelConfig?.provider || "mistral";
       const modelId = modelConfig?.modelId || "mistral-large-latest";
-      
+
       console.log(`[AI Query] Start: ${modelId} (${provider})`);
-      
+
       const currentConfig: ModelConfig = { provider, modelId, apiKey: encryptedApiKeys[provider] };
       setLastUsedModelConfig(currentConfig);
 
@@ -263,12 +253,19 @@ export function setupIpcHandlers() {
         } else if (chunkAny.type === "text-delta") {
           const text = chunkAny.payload?.text || chunkAny.payload?.textDelta || chunkAny.text || "";
           mainWindow?.webContents.send("agent-chunk", { text });
-        } else if (chunkAny.type === "thought" || chunkAny.type === "reasoning" || chunkAny.type === "thought-delta") {
-          const thought = chunkAny.payload?.text || chunkAny.payload?.textDelta || chunkAny.text || "";
+        } else if (
+          chunkAny.type === "thought" ||
+          chunkAny.type === "reasoning" ||
+          chunkAny.type === "thought-delta"
+        ) {
+          const thought =
+            chunkAny.payload?.text || chunkAny.payload?.textDelta || chunkAny.text || "";
           mainWindow?.webContents.send("agent-reflection", { type: "thought", content: thought });
         } else if (chunkAny.type === "error") {
           const errorMsg = chunkAny.payload?.message || chunkAny.message || "Unknown error";
-          const details = chunkAny.payload?.details ? `\n\n**Details:** ${JSON.stringify(chunkAny.payload.details, null, 2)}` : "";
+          const details = chunkAny.payload?.details
+            ? `\n\n**Details:** ${JSON.stringify(chunkAny.payload.details, null, 2)}`
+            : "";
           mainWindow?.webContents.send("agent-chunk", {
             text: `\n\n> ⚠️ **Error:** ${errorMsg}${details}`,
           });
@@ -282,11 +279,15 @@ export function setupIpcHandlers() {
       if (usage) {
         promptTokens = (usage as any).promptTokens || 0;
         completionTokens = (usage as any).completionTokens || 0;
-        
-        const pricing = MODEL_PRICING[modelId] || { prompt: 0, completion: 0 };
-        const cost = (promptTokens / 1_000_000) * pricing.prompt + (completionTokens / 1_000_000) * pricing.completion;
 
-        console.log(`[AI Query] Complete: ${promptTokens + completionTokens} tokens used (Cost: ~$${cost.toFixed(4)})`);
+        const pricing = MODEL_PRICING[modelId] || { prompt: 0, completion: 0 };
+        const cost =
+          (promptTokens / 1_000_000) * pricing.prompt +
+          (completionTokens / 1_000_000) * pricing.completion;
+
+        console.log(
+          `[AI Query] Complete: ${promptTokens + completionTokens} tokens used (Cost: ~$${cost.toFixed(4)})`,
+        );
 
         mainWindow?.webContents.send("agent-reflection", {
           type: "usage",

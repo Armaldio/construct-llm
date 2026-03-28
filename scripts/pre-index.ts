@@ -47,11 +47,6 @@ const embeddingModel = {
   },
 };
 
-const vectorStore = new LibSQLVector({
-  id: "construct-projects",
-  url: "file:prebuilt-assets.db",
-});
-
 async function getAllFiles(dirPath: string, arrayOfFiles: string[] = []) {
   try {
     const files = await fs.readdir(dirPath);
@@ -76,11 +71,90 @@ async function getAllFiles(dirPath: string, arrayOfFiles: string[] = []) {
   return arrayOfFiles;
 }
 
-async function main() {
-  console.log("Starting unified pre-indexing of Manual and Example Projects...");
-  const vStore = vectorStore;
+async function pruneJson(obj: any): Promise<any> {
+  if (Array.isArray(obj)) {
+    return Promise.all(obj.map(pruneJson));
+  } else if (obj !== null && typeof obj === "object") {
+    const newObj: any = {};
+    for (const key of Object.keys(obj)) {
+      if (key === "sid" || key === "uistate") continue;
+      newObj[key] = await pruneJson(obj[key]);
+    }
+    return newObj;
+  }
+  return obj;
+}
+
+async function downloadLatestManual() {
+  const manualUrl = "https://www.construct.net/en/make-games/manuals/construct-3";
+  const assetsDir = path.join(process.cwd(), "assets");
+  const targetPath = path.join(assetsDir, "construct-3.pdf");
 
   try {
+    console.log(`[1/5] Checking for latest manual at ${manualUrl}...`);
+    await fs.mkdir(assetsDir, { recursive: true });
+
+    // Added 10s timeout to fetch
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
+    const response = await fetch(manualUrl, { signal: controller.signal });
+    clearTimeout(timeout);
+
+    const html = await response.text();
+
+    const pdfUrlMatch = html.match(
+      /https?:\/\/construct-static\.com\/downloads\/[^"']*?construct-3\.pdf/,
+    );
+
+    if (pdfUrlMatch) {
+      const pdfUrl = pdfUrlMatch[0];
+      console.log(`[1/5] Found current manual link: ${pdfUrl}`);
+      console.log("[1/5] Downloading latest manual...");
+      execSync(`curl -L "${pdfUrl}" -o "${targetPath}"`, { stdio: "inherit" });
+      console.log("[1/5] Manual download complete.");
+    } else {
+      console.warn("[1/5] Could not find the manual download link. Using existing file.");
+    }
+  } catch (e: any) {
+    console.error("[1/5] Failed to automate manual download:", e.message);
+  }
+}
+
+async function main() {
+  console.log("=== Construct LLM Optimized Indexing Session ===");
+
+  // 0. Clean old database and temporary files for a fresh start
+  const dbPath = path.join(process.cwd(), "prebuilt-assets.db");
+  const tempFiles = [dbPath, `${dbPath}-journal`, `${dbPath}-wal`, `${dbPath}-shm`];
+
+  for (const f of tempFiles) {
+    try {
+      if (await fs.stat(f).catch(() => null)) {
+        await fs.unlink(f);
+        console.log(`[0/5] Cleaned up ${path.basename(f)}`);
+      }
+    } catch (e) {
+      // Ignore
+    }
+  }
+
+  // 1. Automate manual download to stay up to date
+  await downloadLatestManual();
+
+  // Initialize embedding model explicitly to show status
+  console.log("[2/5] Initializing local embedding model (Xenova/all-MiniLM-L6-v2)...");
+  console.log("      Note: The first run may take a minute to download model files.");
+  await xenovaModel.initialize();
+  console.log("[2/5] Embedding model ready.");
+
+  // Initialize vector store AFTER cleanup to avoid stale handles
+  const vStore = new LibSQLVector({
+    id: "construct-projects",
+    url: `file:${dbPath}`,
+  });
+  try {
+    console.log("[3/5] Setting up vector indices...");
     await vStore.createIndex({ indexName: "manual_content", dimension: 384 });
     await vStore.createIndex({ indexName: "snippet_content", dimension: 384 });
   } catch (e) {
@@ -89,38 +163,52 @@ async function main() {
 
   const processAndUpsert = async (
     chunks: { text: string; metadata: Record<string, any> }[],
-    prefix: string,
+    projectName: string,
     indexName: string,
   ) => {
+    if (chunks.length === 0) return;
+
     const vectors: number[][] = [];
     const ids: string[] = [];
     const metadata: Record<string, any>[] = [];
-    for (let i = 0; i < chunks.length; i++) {
-      try {
-        const chunk = chunks[i];
-        const res = await embeddingModel.doEmbed({ values: [chunk.text] });
 
-        if (res && res.embeddings && res.embeddings[0]) {
-          const embeddingArray = Array.from(res.embeddings[0]);
-          vectors.push(embeddingArray);
-          ids.push(`${prefix}-chunk-${i}`.replace(/[^a-zA-Z0-9-]/g, "_"));
-          metadata.push(chunk.metadata);
+    // Increased batch size for faster embedding
+    const batchSize = 50;
+    for (let i = 0; i < chunks.length; i += batchSize) {
+      const batch = chunks.slice(i, i + batchSize);
+      try {
+        const res = await embeddingModel.doEmbed({ values: batch.map((c) => c.text) });
+
+        if (res && res.embeddings) {
+          res.embeddings.forEach((embeddingArray: any, idx: number) => {
+            vectors.push(Array.from(embeddingArray));
+            // Unique ID per project + chunk index
+            ids.push(`${projectName}-${i + idx}`.replace(/[^a-zA-Z0-9-]/g, "_"));
+            metadata.push(batch[idx].metadata);
+          });
         }
       } catch (err) {
-        console.error(`Failed to embed chunk ${i}:`, err);
+        console.error(`      Failed to embed batch starting at ${i}:`, err);
       }
     }
+
     if (vectors.length > 0) {
-      console.log(`Upserting ${vectors.length} vectors for ${prefix}...`);
-      await vStore.upsert({ indexName, vectors, ids, metadata });
+      try {
+        await vStore.upsert({ indexName, vectors, ids, metadata });
+      } catch (upsertErr) {
+        console.error(
+          `      Failed to upsert ${vectors.length} vectors for ${projectName}:`,
+          upsertErr,
+        );
+      }
     }
   };
 
-  // 1. Manual Indexing
+  // 2. Manual Indexing
   const pdfPath = path.join(process.cwd(), "assets", "construct-3.pdf");
   if (await fs.stat(pdfPath).catch(() => null)) {
     try {
-      console.log("Processing manual PDF...");
+      console.log("[4/5] Parsing manual PDF...");
       const dataBuffer = await fs.readFile(pdfPath);
       const parser = new PDFParse({ data: dataBuffer });
       const result = await parser.getText();
@@ -129,14 +217,17 @@ async function main() {
         "",
       );
 
-      const sectionRegex = /([A-Z0-9\s\n&]{3,})\nView online: (https:\/\/www\.construct\.net\/[^\s]+)/g;
+      const sectionRegex =
+        /([A-Z0-9\s\n&]{3,})\nView online: (https:\/\/www\.construct\.net\/[^\s]+)/g;
       let lastIndex = 0;
       let match;
       const sections: { title: string; url: string; content: string }[] = [];
 
       while ((match = sectionRegex.exec(cleanedText)) !== null) {
         if (sections.length > 0) {
-          sections[sections.length - 1].content = cleanedText.substring(lastIndex, match.index).trim();
+          sections[sections.length - 1].content = cleanedText
+            .substring(lastIndex, match.index)
+            .trim();
         }
         sections.push({ title: match[1].trim().replace(/\n/g, " "), url: match[2], content: "" });
         lastIndex = match.index + match[0].length;
@@ -145,94 +236,145 @@ async function main() {
         sections[sections.length - 1].content = cleanedText.substring(lastIndex).trim();
       }
 
+      console.log(`[4/5] Indexing ${sections.length} manual sections...`);
       for (const section of sections) {
         if (!section.content || section.content.length < 50) continue;
         const doc = MDocument.fromText(section.content, {
-          metadata: { title: section.title, url: section.url, path: "assets/construct-3.pdf", type: "manual" },
+          metadata: {
+            title: section.title,
+            url: section.url,
+            path: "assets/construct-3.pdf",
+            type: "manual",
+          },
         });
         const docChunks = await doc.chunk({ strategy: "recursive", maxSize: 800, overlap: 150 });
         await processAndUpsert(
           docChunks.map((c) => ({
             text: `### ${section.title}\nSource: ${section.url}\n\n${c.text}`,
-            metadata: { text: c.text, title: section.title, url: section.url, path: "assets/construct-3.pdf", type: "manual" },
+            metadata: {
+              text: c.text,
+              title: section.title,
+              url: section.url,
+              path: "assets/construct-3.pdf",
+              type: "manual",
+            },
           })),
           `manual-${section.title.replace(/[^a-zA-Z0-9]/g, "-")}`,
           "manual_content",
         );
       }
+      console.log("[4/5] Manual indexing complete.");
     } catch (pdfError) {
-      console.error("Failed to process manual PDF:", pdfError);
+      console.error("[4/5] Failed to process manual PDF:", pdfError);
     }
   }
 
-  // 2. Project Examples Indexing (Local + Remote)
+  // 3. Clone Scirra Repo
+  await fs.mkdir(TEMP_DIR, { recursive: true });
+  const scirraRepoName = "Construct-Example-Projects";
+  const scirraTargetPath = path.join(TEMP_DIR, scirraRepoName);
+
+  try {
+    console.log(`[5/5] Updating remote examples: ${SCIRRA_EXAMPLES_URL}...`);
+    if (!(await fs.stat(scirraTargetPath).catch(() => null))) {
+      execSync(`git clone ${SCIRRA_EXAMPLES_URL} ${scirraTargetPath}`, { stdio: "inherit" });
+    } else {
+      console.log("[5/5] Remote examples already cloned.");
+    }
+  } catch (e: any) {
+    console.error("[5/5] Failed to clone remote projects:", e.message);
+  }
+
+  // 4. Project Discovery
   const allProjectRoots: string[] = [];
   async function findProjectRoots(dir: string) {
     if (!(await fs.stat(dir).catch(() => null))) return;
     const files = await fs.readdir(dir);
-    if (files.includes("project.c3proj")) {
+    if (files.indexOf("project.c3proj") !== -1) {
       allProjectRoots.push(dir);
       return;
     }
     for (const file of files) {
       const fullPath = path.join(dir, file);
-      if (file === ".git" || file === "node_modules") continue;
+      if (file === ".git" || file === "node_modules" || file === "temp_projects") continue;
       if ((await fs.stat(fullPath)).isDirectory()) {
         await findProjectRoots(fullPath);
       }
     }
   }
 
-  // A. Clone Scirra Repo (Remote)
-  await fs.mkdir(TEMP_DIR, { recursive: true });
-  const repoName = "Construct-Example-Projects";
-  const scirraTargetPath = path.join(TEMP_DIR, repoName);
-
-  try {
-    console.log(`Updating remote examples: ${SCIRRA_EXAMPLES_URL}...`);
-    if (await fs.stat(scirraTargetPath).catch(() => null)) {
-      console.log("Repo already exists, skipping clone.");
-    } else {
-      execSync(`git clone ${SCIRRA_EXAMPLES_URL} ${scirraTargetPath}`, { stdio: "inherit" });
-    }
-  } catch (e: any) {
-    console.error(`Failed to clone remote project:`, e.message);
-  }
-
-  // B. Scan all sources
-  console.log("Scanning for projects in examples/ and temp_projects/...");
+  console.log("[5/5] Scanning local and remote directories for projects...");
   await findProjectRoots(path.join(process.cwd(), "examples"));
   await findProjectRoots(TEMP_DIR);
 
-  console.log(`Found ${allProjectRoots.length} projects to index.`);
+  const totalProjects = allProjectRoots.length;
+  console.log(`[5/5] Found ${totalProjects} projects to index.`);
 
-  for (const resolvedPath of allProjectRoots) {
+  // 5. Parallel Project Indexing
+  const CONCURRENCY = 5;
+  console.log(`[5/5] Processing projects with concurrency pool size: ${CONCURRENCY}`);
+
+  const projectQueue = [...allProjectRoots];
+  let completedCount = 0;
+
+  async function processNextProject() {
+    if (projectQueue.length === 0) return;
+    const resolvedPath = projectQueue.shift()!;
+    const projectName = path.basename(resolvedPath);
+    const currentId = ++completedCount;
+
     try {
-      const projectName = path.basename(resolvedPath);
-      console.log(`Indexing project: ${projectName}`);
       const allFiles = await getAllFiles(resolvedPath);
+      const allProjectChunks: { text: string; metadata: Record<string, any> }[] = [];
+
       for (const file of allFiles) {
         const relativePath = path.relative(resolvedPath, file).replace(/\\/g, "/");
         if (relativePath.includes(".uistate.json") || relativePath.includes(".git")) continue;
-        const content = await fs.readFile(file, "utf8");
+
+        let content = await fs.readFile(file, "utf8");
+
+        if (file.endsWith(".json")) {
+          try {
+            const json = JSON.parse(content);
+            const pruned = await pruneJson(json);
+            content = JSON.stringify(pruned);
+          } catch (e) {}
+        }
+
         const fileType = relativePath.split("/")[0] || "root";
         const textToEmbed = `Project: ${projectName}\nFile: ${relativePath}\nType: ${fileType}\nContent:\n${content}`;
+
         const doc = MDocument.fromText(textToEmbed, {
-          metadata: { text: textToEmbed, project: projectName, path: relativePath, type: "project-file", fileType: fileType }
+          metadata: {
+            project: projectName,
+            path: relativePath,
+            type: "project-file",
+            fileType: fileType,
+          },
         });
-        const chunks = await doc.chunk({ strategy: "recursive", maxSize: 2000, overlap: 200 });
-        await processAndUpsert(
-          chunks.map(c => ({ text: c.text, metadata: { ...c.metadata, text: c.text } })),
-          `${projectName}-${relativePath.replace(/[^a-zA-Z0-9]/g, "-")}`,
-          "snippet_content"
+
+        // Optimization: Increased maxSize to avoid warnings with minified JSON
+        const docChunks = await doc.chunk({ strategy: "recursive", maxSize: 2000, overlap: 200 });
+
+        allProjectChunks.push(
+          ...docChunks.map((c) => ({ text: c.text, metadata: { ...c.metadata, text: c.text } })),
         );
       }
+
+      process.stdout.write(
+        `(${currentId}/${totalProjects}) Indexing ${projectName} [${allProjectChunks.length} chunks from ${allFiles.length} files]...\n`,
+      );
+      await processAndUpsert(allProjectChunks, projectName, "snippet_content");
     } catch (e: any) {
-      console.error(`Failed to index project ${resolvedPath}:`, e.message);
+      console.error(`\n[!] Failed to index project ${projectName}:`, e.message);
     }
+    await processNextProject();
   }
 
-  console.log("Pre-indexing complete! Generated prebuilt-assets.db");
+  // Start the pool
+  await Promise.all(Array.from({ length: CONCURRENCY }).map(() => processNextProject()));
+
+  console.log("\n=== Pre-indexing complete! Generated optimized prebuilt-assets.db ===");
 }
 
 main().catch(console.error);
