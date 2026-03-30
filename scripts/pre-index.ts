@@ -156,6 +156,22 @@ function pruneJson(obj: any): any {
   return obj;
 }
 
+async function cloneExamples() {
+  try {
+    const stats = await fs.stat(TEMP_DIR).catch(() => null);
+    if (!stats) {
+      console.log(`[1/5] Cloning example projects from ${SCIRRA_EXAMPLES_URL}...`);
+      await fs.mkdir(path.dirname(TEMP_DIR), { recursive: true });
+      execSync(`git clone "${SCIRRA_EXAMPLES_URL}" "${TEMP_DIR}"`, { stdio: "inherit" });
+    } else {
+      console.log(`[1/5] Updating example projects in ${path.basename(TEMP_DIR)}...`);
+      execSync(`git -C "${TEMP_DIR}" pull`, { stdio: "inherit" });
+    }
+  } catch (e: any) {
+    console.error("[1/5] Failed to clone or update examples:", e.message);
+  }
+}
+
 async function downloadLatestManual() {
   const manualUrl = "https://www.construct.net/en/make-games/manuals/construct-3";
   const assetsDir = path.join(process.cwd(), "assets");
@@ -194,6 +210,7 @@ async function main() {
   const dbPath = path.join(process.cwd(), "prebuilt-assets.db");
   console.log(`[0/5] Using persistent database at ${path.basename(dbPath)}`);
 
+  await cloneExamples();
   await downloadLatestManual();
 
   console.log("[2/5] Initializing local embedding model (Xenova/all-MiniLM-L6-v2)...");
@@ -272,7 +289,6 @@ async function main() {
   }
 
   console.log("[5/5] Scanning directories for projects...");
-  await findProjectRoots(path.join(process.cwd(), "examples"));
   await findProjectRoots(TEMP_DIR);
 
   const totalProjects = allProjectRoots.length;
