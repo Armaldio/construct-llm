@@ -3,7 +3,7 @@ import { MDocument } from "@mastra/rag";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { pipeline } from "@xenova/transformers";
-import pdf from "pdf-parse";
+import { PDFParse } from "pdf-parse";
 import { execSync } from "node:child_process";
 import { createClient } from "@libsql/client";
 import crypto from "node:crypto";
@@ -293,33 +293,6 @@ async function main() {
   // Raw client for idempotency checks and cleanup
   const client = createClient({ url: `file:${dbPath}` });
 
-  // 3.5 Index Manual if needed
-  if (manualExists) {
-    const existingManual = await client.execute("SELECT count(*) as count FROM manual_content");
-    if (Number(existingManual.rows[0]?.count || 0) === 0) {
-      console.log("[3.5/5] Indexing Construct 3 Manual...");
-      try {
-        const dataBuffer = await fs.readFile(manualPath);
-        const data = await pdf(dataBuffer);
-        const doc = MDocument.fromText(data.text, {
-          metadata: { title: "Construct 3 Manual", type: "manual" },
-        });
-        const chunks = await doc.chunk({ strategy: "character", maxSize: 1500, overlap: 100 });
-
-        const manualChunks = chunks.map((c, i) => ({
-          text: c.text,
-          metadata: { title: "Construct 3 Manual", text: c.text, page: i }, // Tools expect metadata.text
-        }));
-
-        await processAndUpsert(manualChunks, "c3-manual", "manual_content");
-        console.log(`[3.5/5] Manual indexed (${manualChunks.length} chunks).`);
-      } catch (e: any) {
-        console.error("[3.5/5] Failed to index manual:", e.message);
-      }
-    } else {
-      console.log("[3.5/5] Manual already indexed. Skipping.");
-    }
-  }
 
   const processAndUpsert = async (
     chunks: { text: string; metadata: Record<string, any> }[],
@@ -346,7 +319,8 @@ async function main() {
         if (res && res.embeddings) {
           res.embeddings.forEach((embeddingArray: any, idx: number) => {
             vectors.push(Array.from(embeddingArray));
-            const chunkPath = batch[idx].metadata.path.replace(/[^a-zA-Z0-9-]/g, "_");
+            const rawPath = batch[idx].metadata.path || "manual";
+            const chunkPath = rawPath.replace(/[^a-zA-Z0-9-]/g, "_");
             ids.push(`${projectName}-${chunkPath}-${i + idx}`);
             metadata.push(batch[idx].metadata);
           });
@@ -371,6 +345,35 @@ async function main() {
 
     return { embeddingTime: totalEmbeddingTime, upsertTime: totalUpsertTime };
   };
+
+  // 3.5 Index Manual if needed
+  if (manualExists) {
+    const existingManual = await client.execute("SELECT count(*) as count FROM manual_content");
+    if (Number(existingManual.rows[0]?.count || 0) === 0) {
+      console.log("[3.5/5] Indexing Construct 3 Manual...");
+      try {
+        const dataBuffer = await fs.readFile(manualPath);
+        const parser = new PDFParse({ data: dataBuffer });
+        const result = await parser.getText();
+        const doc = MDocument.fromText(result.text, {
+          metadata: { title: "Construct 3 Manual", type: "manual" },
+        });
+        const chunks = await doc.chunk({ strategy: "character", maxSize: 1500, overlap: 100 });
+
+        const manualChunks = chunks.map((c, i) => ({
+          text: c.text,
+          metadata: { title: "Construct 3 Manual", text: c.text, page: i }, // Tools expect metadata.text
+        }));
+
+        await processAndUpsert(manualChunks, "c3-manual", "manual_content");
+        console.log(`[3.5/5] Manual indexed (${manualChunks.length} chunks).`);
+      } catch (e: any) {
+        console.error("[3.5/5] Failed to index manual:", e.message);
+      }
+    } else {
+      console.log("[3.5/5] Manual already indexed. Skipping.");
+    }
+  }
 
   // 4. Project Discovery
   const allProjectRoots: string[] = [];
