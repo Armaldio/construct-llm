@@ -7,10 +7,35 @@ import { PDFParse } from "pdf-parse";
 import { execSync } from "node:child_process";
 import { createClient } from "@libsql/client";
 import crypto from "node:crypto";
+import { performance } from "node:perf_hooks";
 
 interface EmbedderResult {
   embeddings: number[][];
 }
+
+interface FileStats {
+  path: string;
+  project: string;
+  duration: number;
+  chunks: number;
+}
+
+interface ProjectStats {
+  name: string;
+  duration: number;
+  fileProcessingTime: number;
+  embeddingTime: number;
+  upsertTime: number;
+  filesCount: number;
+  chunksCount: number;
+}
+
+const sessionStats = {
+  startTime: 0,
+  endTime: 0,
+  projects: [] as ProjectStats[],
+  slowestFiles: [] as FileStats[],
+};
 
 const SCIRRA_EXAMPLES_URL = "https://github.com/Scirra/Construct-Example-Projects.git";
 const TEMP_DIR = path.resolve(process.cwd(), "temp_projects");
@@ -156,6 +181,23 @@ function pruneJson(obj: any): any {
   return obj;
 }
 
+async function getFolderSize(dirPath: string): Promise<number> {
+  let size = 0;
+  try {
+    const files = await fs.readdir(dirPath);
+    for (const file of files) {
+      const filePath = path.join(dirPath, file);
+      const stat = await fs.stat(filePath);
+      if (stat.isDirectory()) {
+        size += await getFolderSize(filePath);
+      } else {
+        size += stat.size;
+      }
+    }
+  } catch (e) {}
+  return size;
+}
+
 async function cloneExamples() {
   try {
     const stats = await fs.stat(TEMP_DIR).catch(() => null);
@@ -236,7 +278,10 @@ async function main() {
     projectName: string,
     indexName: string,
   ) => {
-    if (chunks.length === 0) return;
+    if (chunks.length === 0) return { embeddingTime: 0, upsertTime: 0 };
+
+    let totalEmbeddingTime = 0;
+    let totalUpsertTime = 0;
 
     const vectors: number[][] = [];
     const ids: string[] = [];
@@ -246,11 +291,13 @@ async function main() {
     for (let i = 0; i < chunks.length; i += batchSize) {
       const batch = chunks.slice(i, i + batchSize);
       try {
+        const startEmbed = performance.now();
         const res = await embeddingModel.doEmbed({ values: batch.map((c) => c.text) });
+        totalEmbeddingTime += performance.now() - startEmbed;
+
         if (res && res.embeddings) {
           res.embeddings.forEach((embeddingArray: any, idx: number) => {
             vectors.push(Array.from(embeddingArray));
-            // Use stable IDs to allow upsert logic
             const chunkPath = batch[idx].metadata.path.replace(/[^a-zA-Z0-9-]/g, "_");
             ids.push(`${projectName}-${chunkPath}-${i + idx}`);
             metadata.push(batch[idx].metadata);
@@ -263,11 +310,15 @@ async function main() {
 
     if (vectors.length > 0) {
       try {
+        const startUpsert = performance.now();
         await vStore.upsert({ indexName, vectors, ids, metadata });
+        totalUpsertTime += performance.now() - startUpsert;
       } catch (upsertErr) {
         console.error(`      Failed to upsert ${vectors.length} vectors for ${projectName}:`, upsertErr);
       }
     }
+
+    return { embeddingTime: totalEmbeddingTime, upsertTime: totalUpsertTime };
   };
 
   // 4. Project Discovery
@@ -291,20 +342,44 @@ async function main() {
   console.log("[5/5] Scanning directories for projects...");
   await findProjectRoots(TEMP_DIR);
 
-  const totalProjects = allProjectRoots.length;
+  // Sort projects by size (largest first)
+  console.log("[5/5] Calculating project sizes for optimal ordering...");
+  const projectsWithSizes = await Promise.all(
+    allProjectRoots.map(async (root) => ({
+      path: root,
+      size: await getFolderSize(root),
+    })),
+  );
+  projectsWithSizes.sort((a, b) => b.size - a.size);
+  const sortedProjectRoots = projectsWithSizes.map((p) => p.path);
+
+  const totalProjects = sortedProjectRoots.length;
   console.log(`[5/5] Found ${totalProjects} projects to index.`);
 
   const CONCURRENCY = parseInt(process.env.INDEX_CONCURRENCY || "4", 10);
   console.log(`[5/5] Processing projects with concurrency: ${CONCURRENCY}`);
 
-  const projectQueue = [...allProjectRoots];
+  const projectQueue = [...sortedProjectRoots];
   let completedCount = 0;
+
+  sessionStats.startTime = performance.now();
 
   async function processNextProject() {
     if (projectQueue.length === 0) return;
     const resolvedPath = projectQueue.shift()!;
     const projectName = path.basename(resolvedPath);
     const currentId = ++completedCount;
+    const projectStart = performance.now();
+
+    const projectStats: ProjectStats = {
+      name: projectName,
+      duration: 0,
+      fileProcessingTime: 0,
+      embeddingTime: 0,
+      upsertTime: 0,
+      filesCount: 0,
+      chunksCount: 0,
+    };
 
     try {
       // Idempotency: Fetch existing hashes for this project
@@ -354,6 +429,7 @@ async function main() {
       for (let i = 0; i < filesToProcess.length; i += FILE_CONCURRENCY) {
         const batch = filesToProcess.slice(i, i + FILE_CONCURRENCY);
         const results = await Promise.all(batch.map(async (file) => {
+          const fileStart = performance.now();
           const relativePath = path.relative(resolvedPath, file).replace(/\\/g, "/");
           const content = await fs.readFile(file, "utf8");
           const hash = crypto.createHash("sha256").update(content).digest("hex");
@@ -375,31 +451,95 @@ async function main() {
             separators: ["\n\n", "\n", " ", "}", "]", ";", ","],
           });
 
+          const duration = performance.now() - fileStart;
+          projectStats.fileProcessingTime += duration;
+          
+          sessionStats.slowestFiles.push({
+            path: relativePath,
+            project: projectName,
+            duration,
+            chunks: docChunks.length
+          });
+
           return docChunks.map(c => ({
             text: c.text,
             metadata: { project: projectName, path: relativePath, type: "project-file", fileType, text: c.text, hash }
           }));
         }));
-        results.forEach(chunks => allProjectChunks.push(...chunks));
+        results.forEach(chunks => {
+          allProjectChunks.push(...chunks);
+          projectStats.chunksCount += chunks.length;
+        });
+        projectStats.filesCount += batch.length;
       }
 
       const timestamp = new Date().toLocaleTimeString();
       process.stdout.write(`[${timestamp}] (${currentId}/${totalProjects}) Indexing ${projectName} [${allProjectChunks.length} chunks from ${filesToProcess.length} changed files]...\n`);
-      await processAndUpsert(allProjectChunks, projectName, "snippet_content");
+      const results = await processAndUpsert(allProjectChunks, projectName, "snippet_content");
+      projectStats.embeddingTime = results.embeddingTime;
+      projectStats.upsertTime = results.upsertTime;
     } catch (e: any) {
       console.error(`\n[!] Failed to index project ${projectName}:`, e.message);
+    } finally {
+      projectStats.duration = performance.now() - projectStart;
+      sessionStats.projects.push(projectStats);
     }
     await processNextProject();
   }
 
   await Promise.all(Array.from({ length: CONCURRENCY }).map(() => processNextProject()));
 
+  sessionStats.endTime = performance.now();
+
   console.log("\n[6/6] Finalizing database (VACUUM)...");
   try {
     execSync(`sqlite3 "${dbPath}" "VACUUM;"`, { stdio: "inherit" });
   } catch (e) {}
 
-  console.log("\n=== Pre-indexing complete! ===");
+  printSummary();
+}
+
+function printSummary() {
+  const totalDuration = (sessionStats.endTime - sessionStats.startTime) / 1000;
+  const totalProjects = sessionStats.projects.length;
+  const totalChunks = sessionStats.projects.reduce((acc, p) => acc + p.chunksCount, 0);
+  const totalFiles = sessionStats.projects.reduce((acc, p) => acc + p.filesCount, 0);
+
+  const totalProc = sessionStats.projects.reduce((acc, p) => acc + p.fileProcessingTime, 0) / 1000;
+  const totalEmbed = sessionStats.projects.reduce((acc, p) => acc + p.embeddingTime, 0) / 1000;
+  const totalUpsert = sessionStats.projects.reduce((acc, p) => acc + p.upsertTime, 0) / 1000;
+
+  console.log("\n" + "=".repeat(60));
+  console.log("            INDEXING SESSION SUMMARY");
+  console.log("=".repeat(60));
+  console.log(`Total Duration:      ${totalDuration.toFixed(2)}s`);
+  console.log(`Total Projects:      ${totalProjects}`);
+  console.log(`Total Files Indexed: ${totalFiles}`);
+  console.log(`Total Chunks:        ${totalChunks}`);
+  console.log("-".repeat(60));
+  console.log("PHASE BREAKDOWN (Wall time across concurrency):");
+  console.log(`File Processing:     ${totalProc.toFixed(2)}s (${((totalProc / (totalProc + totalEmbed + totalUpsert)) * 100).toFixed(1)}%)`);
+  console.log(`Embedding:           ${totalEmbed.toFixed(2)}s (${((totalEmbed / (totalProc + totalEmbed + totalUpsert)) * 100).toFixed(1)}%)`);
+  console.log(`DB Upsert:           ${totalUpsert.toFixed(2)}s (${((totalUpsert / (totalProc + totalEmbed + totalUpsert)) * 100).toFixed(1)}%)`);
+  
+  console.log("\nTOP 10 SLOWEST FILES:");
+  sessionStats.slowestFiles
+    .sort((a, b) => b.duration - a.duration)
+    .slice(0, 10)
+    .forEach((f, i) => {
+      console.log(`${(i + 1).toString().padStart(2)}. [${f.duration.toFixed(0).padStart(5)}ms] ${f.project} > ${f.path} (${f.chunks} chunks)`);
+    });
+
+  console.log("\nTOP 5 SLOWEST PROJECTS:");
+  sessionStats.projects
+    .sort((a, b) => b.duration - a.duration)
+    .slice(0, 5)
+    .forEach((p, i) => {
+      console.log(`${(i + 1).toString().padStart(2)}. [${(p.duration / 1000).toFixed(2).padStart(6)}s] ${p.name} (${p.filesCount} files, ${p.chunksCount} chunks)`);
+    });
+
+  console.log("=".repeat(60));
+  console.log("=== Pre-indexing complete! ===");
 }
 
 main().catch(console.error);
