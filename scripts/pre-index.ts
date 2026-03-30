@@ -56,9 +56,9 @@ class XenovaEmbedder {
     const dim = 384;
     const result: number[][] = [];
     for (let i = 0; i < num_texts; i++) {
-        const start = i * dim;
-        const end = (i + 1) * dim;
-        result.push(Array.from(outputs.data.slice(start, end)));
+      const start = i * dim;
+      const end = (i + 1) * dim;
+      result.push(Array.from(outputs.data.slice(start, end)));
     }
     return result;
   }
@@ -191,7 +191,7 @@ async function getFolderSize(dirPath: string): Promise<number> {
         size += stat.size;
       }
     }
-  } catch (e) {}
+  } catch (e) { }
   return size;
 }
 
@@ -260,12 +260,12 @@ async function main() {
     id: "construct-projects",
     url: `file:${dbPath}`,
   });
-  
+
   try {
     console.log("[3/5] Setting up vector indices...");
     await vStore.createIndex({ indexName: "manual_content", dimension: 384 });
     await vStore.createIndex({ indexName: "snippet_content", dimension: 384 });
-  } catch (e) {}
+  } catch (e) { }
 
   // Raw client for idempotency checks and cleanup
   const client = createClient({ url: `file:${dbPath}` });
@@ -331,7 +331,7 @@ async function main() {
       const fullPath = path.join(dir, file);
       if (file === ".git" || file === "node_modules" || file === "temp_projects") continue;
       if ((await fs.stat(fullPath).catch(() => ({ isDirectory: () => false }))).isDirectory()) {
-         await findProjectRoots(fullPath);
+        await findProjectRoots(fullPath);
       }
     }
   }
@@ -353,7 +353,7 @@ async function main() {
   const totalProjects = sortedProjectRoots.length;
   console.log(`[5/5] Found ${totalProjects} projects to index.`);
 
-  const CONCURRENCY = parseInt(process.env.INDEX_CONCURRENCY || "4", 10);
+  const CONCURRENCY = parseInt(process.env.INDEX_CONCURRENCY || "1", 10);
   console.log(`[5/5] Processing projects with concurrency: ${CONCURRENCY}`);
 
   const projectQueue = [...sortedProjectRoots];
@@ -390,7 +390,7 @@ async function main() {
           try {
             const meta = JSON.parse(row.metadata as string);
             if (meta.path && meta.hash) indexedFiles.set(meta.path, meta.hash);
-          } catch (e) {}
+          } catch (e) { }
         }
       }
 
@@ -402,7 +402,7 @@ async function main() {
       for (const file of allFiles) {
         const relativePath = path.relative(resolvedPath, file).replace(/\\/g, "/");
         if (relativePath.includes(".uistate.json") || relativePath.includes(".git")) continue;
-        
+
         const content = await fs.readFile(file, "utf8");
         const hash = crypto.createHash("sha256").update(content).digest("hex");
 
@@ -410,8 +410,8 @@ async function main() {
 
         // Content changed or new file! Clear old chunks and re-index
         await client.execute({
-           sql: "DELETE FROM snippet_content WHERE json_extract(metadata, '$.path') = ? AND json_extract(metadata, '$.project') = ?",
-           args: [relativePath, projectName]
+          sql: "DELETE FROM snippet_content WHERE json_extract(metadata, '$.path') = ? AND json_extract(metadata, '$.project') = ?",
+          args: [relativePath, projectName]
         });
         filesToProcess.push(file);
       }
@@ -435,7 +435,7 @@ async function main() {
           if (file.endsWith(".json")) {
             try {
               processedContent = JSON.stringify(pruneJson(JSON.parse(content)), null, 2);
-            } catch (e) {}
+            } catch (e) { }
           }
 
           const fileType = relativePath.split("/")[0] || "root";
@@ -452,10 +452,10 @@ async function main() {
 
           const duration = performance.now() - fileStart;
           if (duration > 5000) {
-             console.warn(`\n[!] Warning: Extremely slow file conversion (${duration.toFixed(0)}ms): ${relativePath}`);
+            console.warn(`\n[!] Warning: Extremely slow file conversion (${duration.toFixed(0)}ms): ${relativePath}`);
           }
           projectStats.fileProcessingTime += duration;
-          
+
           sessionStats.slowestFiles.push({
             path: relativePath,
             project: projectName,
@@ -493,17 +493,6 @@ async function main() {
 
   sessionStats.endTime = performance.now();
 
-  console.log("\n[6/6] Finalizing database (VACUUM)...");
-  try {
-    // Use the client to VACUUM instead of sqlite3 CLI to ensure vector extensions compatibility
-    await client.execute("VACUUM;");
-  } catch (e: any) {
-    console.error("      Failed to VACUUM through client:", e.message);
-    try {
-       execSync(`sqlite3 "${dbPath}" "VACUUM;"`, { stdio: "ignore" });
-    } catch (innerE) {}
-  }
-
   await printSummary();
 }
 
@@ -534,7 +523,7 @@ async function printSummary() {
   console.log(`File Processing:     ${totalProc.toFixed(2)}s (${((totalProc / (totalProc + totalEmbed + totalUpsert)) * 100).toFixed(1)}%)`);
   console.log(`Embedding:           ${totalEmbed.toFixed(2)}s (${((totalEmbed / (totalProc + totalEmbed + totalUpsert)) * 100).toFixed(1)}%)`);
   console.log(`DB Upsert:           ${totalUpsert.toFixed(2)}s (${((totalUpsert / (totalProc + totalEmbed + totalUpsert)) * 100).toFixed(1)}%)`);
-  
+
   console.log("\nTOP 10 SLOWEST FILES:");
   sessionStats.slowestFiles
     .sort((a, b) => b.duration - a.duration)
