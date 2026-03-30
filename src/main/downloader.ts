@@ -13,7 +13,7 @@ export interface DownloadProgress {
 export async function getLatestDbAssetUrl(
   owner: string,
   repo: string,
-  tagName: string
+  tagName: string,
 ): Promise<string | null> {
   return new Promise((resolve) => {
     const url = `https://api.github.com/repos/${owner}/${repo}/releases/tags/${tagName}`;
@@ -44,7 +44,7 @@ export async function getLatestDbAssetUrl(
 export function downloadFile(
   url: string,
   targetPath: string,
-  onProgress: (progress: DownloadProgress) => void
+  onProgress: (progress: DownloadProgress) => void,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     let existingSize = 0;
@@ -62,7 +62,9 @@ export function downloadFile(
     const request = https.get(url, options, (response: IncomingMessage) => {
       // Handle redirects
       if (response.statusCode === 301 || response.statusCode === 302) {
-        return downloadFile(response.headers.location!, targetPath, onProgress).then(resolve).catch(reject);
+        return downloadFile(response.headers.location!, targetPath, onProgress)
+          .then(resolve)
+          .catch(reject);
       }
 
       if (response.statusCode === 416) {
@@ -100,7 +102,7 @@ export function downloadFile(
         reject(err);
       });
     });
-    
+
     request.on("error", (err: Error) => {
       reject(err);
     });

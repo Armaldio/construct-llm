@@ -3,7 +3,7 @@ import { MDocument } from "@mastra/rag";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { pipeline } from "@xenova/transformers";
-import { PDFParse } from "pdf-parse";
+import pdf from "pdf-parse";
 import { execSync } from "node:child_process";
 import { createClient } from "@libsql/client";
 import crypto from "node:crypto";
@@ -94,7 +94,11 @@ async function getAllFiles(dirPath: string, arrayOfFiles: string[] = []) {
         if ([".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".svg"].includes(ext)) continue;
 
         // SKIP LIBRARIES AND MINIFIED FILES
-        if (file.endsWith(".min.js") || file.endsWith(".js.map") || relativePath.includes("/files/"))
+        if (
+          file.endsWith(".min.js") ||
+          file.endsWith(".js.map") ||
+          relativePath.includes("/files/")
+        )
           continue;
 
         if ([".json", ".js", ".ts"].includes(ext)) {
@@ -129,6 +133,11 @@ function pruneJson(obj: any): any {
           "exportQuality",
           "fileType",
           "useCollisionPoly",
+          "uiprops",
+          "editorOnly",
+          "comments",
+          "isRoot",
+          "folder",
         ].includes(key)
       ) {
         continue;
@@ -191,7 +200,7 @@ async function getFolderSize(dirPath: string): Promise<number> {
         size += stat.size;
       }
     }
-  } catch (e) { }
+  } catch (e) {}
   return size;
 }
 
@@ -227,7 +236,9 @@ async function downloadLatestManual() {
     clearTimeout(timeout);
 
     const html = await response.text();
-    const pdfUrlMatch = html.match(/https?:\/\/construct-static\.com\/downloads\/[^"']*?construct-3\.pdf/);
+    const pdfUrlMatch = html.match(
+      /https?:\/\/construct-static\.com\/downloads\/[^"']*?construct-3\.pdf/,
+    );
 
     if (pdfUrlMatch) {
       const pdfUrl = pdfUrlMatch[0];
@@ -247,10 +258,22 @@ async function main() {
   console.log("=== Construct LLM Optimized Indexing Session ===");
 
   const dbPath = path.join(process.cwd(), "prebuilt-assets.db");
+
+  if (process.env.CI || process.argv.includes("--fresh")) {
+    console.log(`[0/5] Fresh start: removing existing database at ${dbPath}`);
+    await fs.unlink(dbPath).catch(() => {});
+  }
+
   console.log(`[0/5] Using persistent database at ${path.basename(dbPath)}`);
 
   await cloneExamples();
   await downloadLatestManual();
+
+  const manualPath = path.join(process.cwd(), "assets", "construct-3.pdf");
+  const manualExists = await fs
+    .stat(manualPath)
+    .then(() => true)
+    .catch(() => false);
 
   console.log("[2/5] Initializing local embedding model (Xenova/all-MiniLM-L6-v2)...");
   await xenovaModel.initialize();
@@ -265,10 +288,38 @@ async function main() {
     console.log("[3/5] Setting up vector indices...");
     await vStore.createIndex({ indexName: "manual_content", dimension: 384 });
     await vStore.createIndex({ indexName: "snippet_content", dimension: 384 });
-  } catch (e) { }
+  } catch (e) {}
 
   // Raw client for idempotency checks and cleanup
   const client = createClient({ url: `file:${dbPath}` });
+
+  // 3.5 Index Manual if needed
+  if (manualExists) {
+    const existingManual = await client.execute("SELECT count(*) as count FROM manual_content");
+    if (Number(existingManual.rows[0]?.count || 0) === 0) {
+      console.log("[3.5/5] Indexing Construct 3 Manual...");
+      try {
+        const dataBuffer = await fs.readFile(manualPath);
+        const data = await pdf(dataBuffer);
+        const doc = MDocument.fromText(data.text, {
+          metadata: { title: "Construct 3 Manual", type: "manual" },
+        });
+        const chunks = await doc.chunk({ strategy: "character", maxSize: 1500, overlap: 100 });
+
+        const manualChunks = chunks.map((c, i) => ({
+          text: c.text,
+          metadata: { title: "Construct 3 Manual", text: c.text, page: i }, // Tools expect metadata.text
+        }));
+
+        await processAndUpsert(manualChunks, "c3-manual", "manual_content");
+        console.log(`[3.5/5] Manual indexed (${manualChunks.length} chunks).`);
+      } catch (e: any) {
+        console.error("[3.5/5] Failed to index manual:", e.message);
+      }
+    } else {
+      console.log("[3.5/5] Manual already indexed. Skipping.");
+    }
+  }
 
   const processAndUpsert = async (
     chunks: { text: string; metadata: Record<string, any> }[],
@@ -311,7 +362,10 @@ async function main() {
         await vStore.upsert({ indexName, vectors, ids, metadata });
         totalUpsertTime += performance.now() - startUpsert;
       } catch (upsertErr) {
-        console.error(`      Failed to upsert ${vectors.length} vectors for ${projectName}:`, upsertErr);
+        console.error(
+          `      Failed to upsert ${vectors.length} vectors for ${projectName}:`,
+          upsertErr,
+        );
       }
     }
 
@@ -390,7 +444,7 @@ async function main() {
           try {
             const meta = JSON.parse(row.metadata as string);
             if (meta.path && meta.hash) indexedFiles.set(meta.path, meta.hash);
-          } catch (e) { }
+          } catch (e) {}
         }
       }
 
@@ -411,13 +465,15 @@ async function main() {
         // Content changed or new file! Clear old chunks and re-index
         await client.execute({
           sql: "DELETE FROM snippet_content WHERE json_extract(metadata, '$.path') = ? AND json_extract(metadata, '$.project') = ?",
-          args: [relativePath, projectName]
+          args: [relativePath, projectName],
         });
         filesToProcess.push(file);
       }
 
       if (filesToProcess.length === 0) {
-        console.log(`[${new Date().toLocaleTimeString()}] (${currentId}/${totalProjects}) Skipping ${projectName} (No changes).`);
+        console.log(
+          `[${new Date().toLocaleTimeString()}] (${currentId}/${totalProjects}) Skipping ${projectName} (No changes).`,
+        );
         return processNextProject();
       }
 
@@ -425,50 +481,69 @@ async function main() {
       const FILE_CONCURRENCY = 10;
       for (let i = 0; i < filesToProcess.length; i += FILE_CONCURRENCY) {
         const batch = filesToProcess.slice(i, i + FILE_CONCURRENCY);
-        const results = await Promise.all(batch.map(async (file) => {
-          const fileStart = performance.now();
-          const relativePath = path.relative(resolvedPath, file).replace(/\\/g, "/");
-          const content = await fs.readFile(file, "utf8");
-          const hash = crypto.createHash("sha256").update(content).digest("hex");
+        const results = await Promise.all(
+          batch.map(async (file) => {
+            const fileStart = performance.now();
+            const relativePath = path.relative(resolvedPath, file).replace(/\\/g, "/");
+            const content = await fs.readFile(file, "utf8");
+            const hash = crypto.createHash("sha256").update(content).digest("hex");
 
-          let processedContent = content;
-          if (file.endsWith(".json")) {
-            try {
-              processedContent = JSON.stringify(pruneJson(JSON.parse(content)), null, 2);
-            } catch (e) { }
-          }
+            let processedContent = content;
+            if (file.endsWith(".json")) {
+              try {
+                processedContent = JSON.stringify(pruneJson(JSON.parse(content)), null, 2);
+              } catch (e) {}
+            }
 
-          const fileType = relativePath.split("/")[0] || "root";
-          const doc = MDocument.fromText(`Project: ${projectName}\nFile: ${relativePath}\nType: ${fileType}\nContent:\n${processedContent}`, {
-            metadata: { project: projectName, path: relativePath, type: "project-file", fileType, hash },
-          });
+            const fileType = relativePath.split("/")[0] || "root";
+            const doc = MDocument.fromText(
+              `Project: ${projectName}\nFile: ${relativePath}\nType: ${fileType}\nContent:\n${processedContent}`,
+              {
+                metadata: {
+                  project: projectName,
+                  path: relativePath,
+                  type: "project-file",
+                  fileType,
+                  hash,
+                },
+              },
+            );
 
-          const docChunks = await doc.chunk({
-            strategy: "recursive",
-            maxSize: 2000,
-            overlap: 200,
-            separators: ["\n\n", "\n"], // Even more simplified for speed
-          });
+            const docChunks = await doc.chunk({
+              strategy: "character", // Faster and avoids regex backtracking in huge objects
+              maxSize: 1500,
+              overlap: 100,
+            });
 
-          const duration = performance.now() - fileStart;
-          if (duration > 5000) {
-            console.warn(`\n[!] Warning: Extremely slow file conversion (${duration.toFixed(0)}ms): ${relativePath}`);
-          }
-          projectStats.fileProcessingTime += duration;
+            const duration = performance.now() - fileStart;
+            if (duration > 5000) {
+              console.warn(
+                `\n[!] Warning: Extremely slow file conversion (${duration.toFixed(0)}ms): ${relativePath}`,
+              );
+            }
+            projectStats.fileProcessingTime += duration;
 
-          sessionStats.slowestFiles.push({
-            path: relativePath,
-            project: projectName,
-            duration,
-            chunks: docChunks.length
-          });
+            sessionStats.slowestFiles.push({
+              path: relativePath,
+              project: projectName,
+              duration,
+              chunks: docChunks.length,
+            });
 
-          return docChunks.map(c => ({
-            text: c.text,
-            metadata: { project: projectName, path: relativePath, type: "project-file", fileType, text: c.text, hash }
-          }));
-        }));
-        results.forEach(chunks => {
+            return docChunks.map((c) => ({
+              text: c.text,
+              metadata: {
+                project: projectName,
+                path: relativePath,
+                type: "project-file",
+                fileType,
+                text: c.text,
+                hash,
+              },
+            }));
+          }),
+        );
+        results.forEach((chunks) => {
           allProjectChunks.push(...chunks);
           projectStats.chunksCount += chunks.length;
         });
@@ -476,7 +551,9 @@ async function main() {
       }
 
       const timestamp = new Date().toLocaleTimeString();
-      process.stdout.write(`[${timestamp}] (${currentId}/${totalProjects}) Indexing ${projectName} [${allProjectChunks.length} chunks from ${filesToProcess.length} changed files]...\n`);
+      process.stdout.write(
+        `[${timestamp}] (${currentId}/${totalProjects}) Indexing ${projectName} [${allProjectChunks.length} chunks from ${filesToProcess.length} changed files]...\n`,
+      );
       const results = await processAndUpsert(allProjectChunks, projectName, "snippet_content");
       projectStats.embeddingTime = results.embeddingTime;
       projectStats.upsertTime = results.upsertTime;
@@ -492,6 +569,11 @@ async function main() {
   await Promise.all(Array.from({ length: CONCURRENCY }).map(() => processNextProject()));
 
   sessionStats.endTime = performance.now();
+
+  console.log("\n[6/6] Finalizing database...");
+  try {
+    await client.execute("PRAGMA optimize;");
+  } catch (e) {}
 
   await printSummary();
 }
@@ -520,16 +602,24 @@ async function printSummary() {
   console.log(`Total Chunks:        ${totalChunks}`);
   console.log("-".repeat(60));
   console.log("PHASE BREAKDOWN (Wall time across concurrency):");
-  console.log(`File Processing:     ${totalProc.toFixed(2)}s (${((totalProc / (totalProc + totalEmbed + totalUpsert)) * 100).toFixed(1)}%)`);
-  console.log(`Embedding:           ${totalEmbed.toFixed(2)}s (${((totalEmbed / (totalProc + totalEmbed + totalUpsert)) * 100).toFixed(1)}%)`);
-  console.log(`DB Upsert:           ${totalUpsert.toFixed(2)}s (${((totalUpsert / (totalProc + totalEmbed + totalUpsert)) * 100).toFixed(1)}%)`);
+  console.log(
+    `File Processing:     ${totalProc.toFixed(2)}s (${((totalProc / (totalProc + totalEmbed + totalUpsert)) * 100).toFixed(1)}%)`,
+  );
+  console.log(
+    `Embedding:           ${totalEmbed.toFixed(2)}s (${((totalEmbed / (totalProc + totalEmbed + totalUpsert)) * 100).toFixed(1)}%)`,
+  );
+  console.log(
+    `DB Upsert:           ${totalUpsert.toFixed(2)}s (${((totalUpsert / (totalProc + totalEmbed + totalUpsert)) * 100).toFixed(1)}%)`,
+  );
 
   console.log("\nTOP 10 SLOWEST FILES:");
   sessionStats.slowestFiles
     .sort((a, b) => b.duration - a.duration)
     .slice(0, 10)
     .forEach((f, i) => {
-      console.log(`${(i + 1).toString().padStart(2)}. [${f.duration.toFixed(0).padStart(5)}ms] ${f.project} > ${f.path} (${f.chunks} chunks)`);
+      console.log(
+        `${(i + 1).toString().padStart(2)}. [${f.duration.toFixed(0).padStart(5)}ms] ${f.project} > ${f.path} (${f.chunks} chunks)`,
+      );
     });
 
   console.log("\nTOP 5 SLOWEST PROJECTS:");
@@ -537,7 +627,9 @@ async function printSummary() {
     .sort((a, b) => b.duration - a.duration)
     .slice(0, 5)
     .forEach((p, i) => {
-      console.log(`${(i + 1).toString().padStart(2)}. [${(p.duration / 1000).toFixed(2).padStart(6)}s] ${p.name} (${p.filesCount} files, ${p.chunksCount} chunks)`);
+      console.log(
+        `${(i + 1).toString().padStart(2)}. [${(p.duration / 1000).toFixed(2).padStart(6)}s] ${p.name} (${p.filesCount} files, ${p.chunksCount} chunks)`,
+      );
     });
 
   console.log("=".repeat(60));

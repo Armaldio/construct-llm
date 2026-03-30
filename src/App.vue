@@ -259,7 +259,9 @@ onMounted(async () => {
         <div
           class="loader-bar"
           :class="{ 'loader-animated': store.startupStatus.percent === 0 }"
-          :style="{ width: store.startupStatus.percent > 0 ? store.startupStatus.percent + '%' : '30%' }"
+          :style="{
+            width: store.startupStatus.percent > 0 ? store.startupStatus.percent + '%' : '30%',
+          }"
         ></div>
       </div>
     </div>
