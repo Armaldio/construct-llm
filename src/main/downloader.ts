@@ -1,6 +1,8 @@
 import https from "node:https";
 import fs from "node:fs";
+import path from "node:path";
 import { IncomingMessage } from "node:http";
+import AdmZip from "adm-zip";
 
 export interface DownloadProgress {
   percent: number;
@@ -28,7 +30,7 @@ export async function getLatestDbAssetUrl(
         res.on("end", () => {
           try {
             const release = JSON.parse(data);
-            const asset = release.assets?.find((a: any) => a.name === "prebuilt-assets.db");
+            const asset = release.assets?.find((a: any) => a.name === "prebuilt-assets.db.zip");
             resolve(asset?.browser_download_url || null);
           } catch (e) {
             resolve(null);
@@ -98,9 +100,23 @@ export function downloadFile(
         reject(err);
       });
     });
-
+    
     request.on("error", (err: Error) => {
       reject(err);
     });
+  });
+}
+
+export async function decompressFile(zipPath: string, targetDir: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    try {
+      const zip = new AdmZip(zipPath);
+      zip.extractAllTo(targetDir, true);
+      // Optional: Delete the zip after extraction
+      fs.unlinkSync(zipPath);
+      resolve();
+    } catch (e) {
+      reject(e);
+    }
   });
 }

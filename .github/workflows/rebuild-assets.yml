@@ -32,10 +32,13 @@ jobs:
         env:
           NODE_OPTIONS: "--max-old-space-size=4096"
 
+      - name: Compress Database
+        run: zip prebuilt-assets.db.zip prebuilt-assets.db
+
       - name: Upload Database to Release
         uses: softprops/action-gh-release@v2
         with:
-          files: prebuilt-assets.db
+          files: prebuilt-assets.db.zip
           tag_name: database-assets
           name: "Database Assets"
           body: "Pre-indexed database for Construct LLM."

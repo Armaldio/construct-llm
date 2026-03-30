@@ -116,13 +116,28 @@ function pruneJson(obj: any): any {
   } else if (obj !== null && typeof obj === "object") {
     const newObj: any = {};
     for (const key of Object.keys(obj)) {
-      // 1. GLOBAL PRUNING
-      if (key === "sid" || key === "uistate") continue;
+      // 1. GLOBAL PRUNING (Aggressive)
+      if (
+        [
+          "sid",
+          "uistate",
+          "collisionPoly",
+          "points",
+          "originalSource",
+          "imageSpriteId",
+          "exportFormat",
+          "exportQuality",
+          "fileType",
+          "useCollisionPoly",
+        ].includes(key)
+      ) {
+        continue;
+      }
 
       // 2. LAYOUT PRUNING
       if (key === "tilemapData" && obj[key] && typeof obj[key] === "object") {
         const { data, ...rest } = obj[key];
-        newObj[key] = rest; // Keep dimensions, lose the massive encoded string
+        newObj[key] = rest;
         continue;
       }
 
@@ -132,9 +147,7 @@ function pruneJson(obj: any): any {
         const instanceGroups: Map<string, { count: number; data: any }> = new Map();
 
         for (const inst of instances) {
-          // Quick prune for grouping
-          const { uid, sid, world, ...rest } = inst;
-          // Only prune the rest once
+          const { uid, world, ...rest } = inst;
           const pruned = pruneJson(rest);
           const keyString = JSON.stringify(pruned);
 
@@ -155,25 +168,6 @@ function pruneJson(obj: any): any {
         }
 
         newObj[key] = summarized;
-        continue;
-      }
-
-      // 3. OBJECT TYPE / ANIMATION PRUNING
-      if (key === "frames" && Array.isArray(obj[key])) {
-        newObj[key] = obj[key].map((frame: any) => {
-          const {
-            collisionPoly,
-            imageSpriteId,
-            originX,
-            originY,
-            originalSource,
-            exportFormat,
-            exportQuality,
-            fileType,
-            ...rest
-          } = frame;
-          return rest;
-        });
         continue;
       }
 
@@ -450,8 +444,10 @@ async function main() {
           });
 
           const docChunks = await doc.chunk({
-            strategy: "recursive", maxSize: 2000, overlap: 200,
-            separators: ["\n\n", "\n", " "], // Simplified for speed
+            strategy: "recursive",
+            maxSize: 2000,
+            overlap: 200,
+            separators: ["\n\n", "\n"], // Even more simplified for speed
           });
 
           const duration = performance.now() - fileStart;
@@ -508,10 +504,10 @@ async function main() {
     } catch (innerE) {}
   }
 
-  printSummary();
+  await printSummary();
 }
 
-function printSummary() {
+async function printSummary() {
   const totalDuration = (sessionStats.endTime - sessionStats.startTime) / 1000;
   const totalProjects = sessionStats.projects.length;
   const totalChunks = sessionStats.projects.reduce((acc, p) => acc + p.chunksCount, 0);
@@ -521,10 +517,15 @@ function printSummary() {
   const totalEmbed = sessionStats.projects.reduce((acc, p) => acc + p.embeddingTime, 0) / 1000;
   const totalUpsert = sessionStats.projects.reduce((acc, p) => acc + p.upsertTime, 0) / 1000;
 
+  const dbPath = path.join(process.cwd(), "prebuilt-assets.db");
+  const dbStat = await fs.stat(dbPath).catch(() => null);
+  const dbSizeStr = dbStat ? (dbStat.size / (1024 * 1024)).toFixed(2) + " MB" : "N/A";
+
   console.log("\n" + "=".repeat(60));
   console.log("            INDEXING SESSION SUMMARY");
   console.log("=".repeat(60));
   console.log(`Total Duration:      ${totalDuration.toFixed(2)}s`);
+  console.log(`Total Database Size: ${dbSizeStr}`);
   console.log(`Total Projects:      ${totalProjects}`);
   console.log(`Total Files Indexed: ${totalFiles}`);
   console.log(`Total Chunks:        ${totalChunks}`);

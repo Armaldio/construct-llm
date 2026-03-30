@@ -6,7 +6,7 @@ import { setGlobalMainWindow, getGlobalMainWindow, globalStore, globalDbPath } f
 import { appState, loadState } from "./state";
 import { startWatchingProject, sleep } from "./utils";
 import { setupIpcHandlers } from "./ipc";
-import { getLatestDbAssetUrl, downloadFile } from "./downloader";
+import { getLatestDbAssetUrl, downloadFile, decompressFile } from "./downloader";
 import fs from "node:fs/promises";
 import { existsSync } from "node:fs";
 
@@ -62,7 +62,8 @@ export function setupAppLifecycle() {
 
         const downloadUrl = await getLatestDbAssetUrl(owner, repo, tagName);
         if (downloadUrl) {
-          await downloadFile(downloadUrl, globalDbPath, (p) => {
+          const zipPath = globalDbPath + ".zip";
+          await downloadFile(downloadUrl, zipPath, (p) => {
             mainWindow?.webContents.send("startup-progress", {
               message: `Downloading database... (${p.percent}%)`,
               percent: p.percent,
@@ -70,6 +71,13 @@ export function setupAppLifecycle() {
               total: p.total,
             });
           });
+
+          mainWindow?.webContents.send("startup-progress", {
+            message: "Decompressing database...",
+            percent: 100,
+          });
+
+          await decompressFile(zipPath, path.dirname(globalDbPath));
           dbReady = true;
         } else {
           console.error("[App] Could not find database asset in release.");
