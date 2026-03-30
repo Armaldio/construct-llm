@@ -72,7 +72,7 @@ export const store = reactive({
   isIndexing: false,
   isStreaming: false,
   isStartingUp: true,
-  startupStatus: { step: "Initializing...", detail: "" },
+  startupStatus: { step: "Initializing...", detail: "", percent: 0, error: false },
   projectTree: [] as any[],
   allFiles: [] as any[],
   allEntities: [] as any[],

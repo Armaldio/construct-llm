@@ -4,9 +4,7 @@ import { LibSQLVector, LibSQLStore } from "@mastra/libsql";
 import { Memory } from "@mastra/memory";
 import { Workspace } from "@mastra/core/workspace";
 
-export const globalDbPath = app.isPackaged
-  ? path.join(process.resourcesPath, "prebuilt-assets.db")
-  : path.join(process.cwd(), "prebuilt-assets.db");
+export const globalDbPath = path.join(app.getPath("userData"), "prebuilt-assets.db");
 
 export const globalStore = new LibSQLVector({
   id: "construct-projects",

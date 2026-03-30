@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - master
     paths:
       - "examples/**"
       - "scripts/pre-index.ts"
@@ -12,7 +11,40 @@ on:
   workflow_dispatch:
 
 jobs:
+  index-assets:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build Vector Index
+        run: npm run pre-index
+        env:
+          NODE_OPTIONS: "--max-old-space-size=4096"
+
+      - name: Upload Database to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: prebuilt-assets.db
+          tag_name: database-assets
+          name: "Database Assets"
+          body: "Pre-indexed database for Construct LLM."
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   build-and-package:
+    needs: index-assets
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -22,8 +54,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Install Linux Dependencies
         if: matrix.os == 'ubuntu-latest'
@@ -39,11 +69,6 @@ jobs:
 
       - name: Install dependencies
         run: npm install
-
-      - name: Build Vector Index
-        run: npm run pre-index
-        env:
-          NODE_OPTIONS: "--max-old-space-size=4096"
 
       - name: Package Application (Make)
         run: npm run make

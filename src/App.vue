@@ -225,19 +225,17 @@ onMounted(async () => {
     }
   });
 
-  (window as any).api.onAgentStreamEnd(() => {
-    store.isStreaming = false;
-    if (store.activeThread) {
-      const messages = store.activeThread.messages;
-      const lastMsg = messages[messages.length - 1];
-      if (lastMsg && lastMsg.role === "assistant" && lastMsg.parts) {
-        lastMsg.parts.forEach((part) => {
-          if (part.isStreaming) {
-            part.isStreaming = false;
-          }
-        });
-      }
-    }
+  // Startup progress listener
+  (window as any).api.onStartupProgress((data: any) => {
+    store.startupStatus.step = data.message || "Loading...";
+    store.startupStatus.detail = data.detail || "";
+    store.startupStatus.percent = data.percent || 0;
+    store.startupStatus.error = !!data.error;
+  });
+
+  (window as any).api.onStartupComplete(() => {
+    store.isStartingUp = false;
+    loadState();
   });
 });
 </script>
@@ -250,13 +248,19 @@ onMounted(async () => {
       </div>
       <h1 class="startup-title">Construct LLM</h1>
       <div class="startup-status">
-        <div class="status-step">{{ store.startupStatus.step }}</div>
+        <div class="status-step" :class="{ 'text-red-500': store.startupStatus.error }">
+          {{ store.startupStatus.step }}
+        </div>
         <div class="status-detail" v-if="store.startupStatus.detail">
           {{ store.startupStatus.detail }}
         </div>
       </div>
       <div class="startup-loader">
-        <div class="loader-bar"></div>
+        <div
+          class="loader-bar"
+          :class="{ 'loader-animated': store.startupStatus.percent === 0 }"
+          :style="{ width: store.startupStatus.percent > 0 ? store.startupStatus.percent + '%' : '30%' }"
+        ></div>
       </div>
     </div>
   </div>
@@ -369,8 +373,12 @@ onMounted(async () => {
 .loader-bar {
   height: 100%;
   background: var(--primary-color, #3b82f6);
-  width: 30%;
+  width: 0%;
   border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+.loader-animated {
   animation: loading 1.5s infinite ease-in-out;
 }
 

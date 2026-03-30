@@ -2,10 +2,13 @@ import { app, BrowserWindow, ipcMain } from "electron";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { setGlobalMainWindow, getGlobalMainWindow, globalStore } from "./mastra";
+import { setGlobalMainWindow, getGlobalMainWindow, globalStore, globalDbPath } from "./mastra";
 import { appState, loadState } from "./state";
 import { startWatchingProject, sleep } from "./utils";
 import { setupIpcHandlers } from "./ipc";
+import { getLatestDbAssetUrl, downloadFile } from "./downloader";
+import fs from "node:fs/promises";
+import { existsSync } from "node:fs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -38,20 +41,65 @@ export const createWindow = () => {
 
 export function setupAppLifecycle() {
   app.on("ready", async () => {
-    // Quick check if global DB exists and has rows
-    try {
-      const dummyVector = new Array(384).fill(0.1);
-      await globalStore.query({
-        indexName: "manual_content",
-        queryVector: dummyVector,
-        topK: 1,
-      });
-    } catch (e: any) {
-      console.warn(`Initial manual DB check failed: ${e.message}`);
-    }
-
     await loadState();
     const mainWindow = createWindow();
+
+    // Check if global DB exists
+    const dbExists = existsSync(globalDbPath);
+    let dbReady = dbExists;
+
+    if (!dbExists) {
+      console.log("[App] Database missing. Starting download...");
+      try {
+        const owner = "armaldio"; // Placeholder or from config
+        const repo = "construct-llm";
+        const tagName = "database-assets";
+
+        mainWindow?.webContents.send("startup-progress", {
+          message: "Fetching database info...",
+          percent: 0,
+        });
+
+        const downloadUrl = await getLatestDbAssetUrl(owner, repo, tagName);
+        if (downloadUrl) {
+          await downloadFile(downloadUrl, globalDbPath, (p) => {
+            mainWindow?.webContents.send("startup-progress", {
+              message: `Downloading database... (${p.percent}%)`,
+              percent: p.percent,
+              loaded: p.transferred,
+              total: p.total,
+            });
+          });
+          dbReady = true;
+        } else {
+          console.error("[App] Could not find database asset in release.");
+          mainWindow?.webContents.send("startup-progress", {
+            message: "Error: Database asset not found.",
+            error: true,
+          });
+        }
+      } catch (err: any) {
+        console.error("[App] Download failed:", err);
+        mainWindow?.webContents.send("startup-progress", {
+          message: `Download failed: ${err.message}`,
+          error: true,
+        });
+      }
+    }
+
+    if (dbReady) {
+      // Quick check if global DB is valid
+      try {
+        const dummyVector = new Array(384).fill(0.1);
+        await globalStore.query({
+          indexName: "manual_content",
+          queryVector: dummyVector,
+          topK: 1,
+        });
+      } catch (e: any) {
+        console.warn(`Initial manual DB check failed: ${e.message}`);
+      }
+    }
 
     // Setup IPC handlers now that window is available
     setupIpcHandlers();
