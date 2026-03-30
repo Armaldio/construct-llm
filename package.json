@@ -19,7 +19,8 @@
     "publish": "electron-forge publish",
     "lint": "oxlint . --fix",
     "format": "oxfmt .",
-    "typecheck": "vue-tsc --noEmit"
+    "typecheck": "vue-tsc --noEmit",
+    "db-analysis": "sqlite3 prebuilt-assets.db \"SELECT 'Metadata Total' as Category, SUM(LENGTH(metadata))/1024/1024 || ' MB' as Size FROM snippet_content UNION ALL SELECT 'Embeddings Total', SUM(LENGTH(embedding))/1024/1024 || ' MB' FROM snippet_content UNION ALL SELECT 'Index Shadow Table', SUM(LENGTH(data))/1024/1024 || ' MB' FROM snippet_content_vector_idx_shadow;\""
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.58",

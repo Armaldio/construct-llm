@@ -33,4 +33,5 @@ This project is an Electron-based desktop application acting as a Retrieval-Augm
 - ALWAYS use Context7 MCP when you need up-to-date documentation or examples for external libraries and frameworks.
 - ALWAYS format your code after making edits using `npm run format`.
 - Do not attempt to start the app yourself or run typechecking or run lint
+- **NEVER** run the `pre-index` script yourself because it is too resource-intensive and may crash the environment.
 - **NEVER** edit files using `cat` redirection (e.g., `cat << EOF > file.ts`). It doesn't work well and causes issues. Always use the built-in `write_file` or `replace` tools.
