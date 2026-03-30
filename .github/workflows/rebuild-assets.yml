@@ -12,6 +12,8 @@ on:
 jobs:
   index-assets:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -45,6 +47,8 @@ jobs:
   build-and-package:
     needs: index-assets
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:

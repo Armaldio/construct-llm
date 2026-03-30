@@ -127,23 +127,26 @@ function pruneJson(obj: any): any {
       }
 
       if (key === "instances" && Array.isArray(obj[key])) {
-        const instances = obj[key];
+        const instances = obj[key] as any[];
         const summarized: any[] = [];
         const instanceGroups: Map<string, { count: number; data: any }> = new Map();
 
         for (const inst of instances) {
+          // Quick prune for grouping
           const { uid, sid, world, ...rest } = inst;
+          // Only prune the rest once
           const pruned = pruneJson(rest);
           const keyString = JSON.stringify(pruned);
 
-          if (instanceGroups.has(keyString)) {
-            instanceGroups.get(keyString)!.count++;
+          const group = instanceGroups.get(keyString);
+          if (group) {
+            group.count++;
           } else {
             instanceGroups.set(keyString, { count: 1, data: pruned });
           }
         }
 
-        for (const [_, group] of instanceGroups) {
+        for (const group of instanceGroups.values()) {
           if (group.count > 1) {
             summarized.push({ ...group.data, _count: group.count });
           } else {
@@ -448,10 +451,13 @@ async function main() {
 
           const docChunks = await doc.chunk({
             strategy: "recursive", maxSize: 2000, overlap: 200,
-            separators: ["\n\n", "\n", " ", "}", "]", ";", ","],
+            separators: ["\n\n", "\n", " "], // Simplified for speed
           });
 
           const duration = performance.now() - fileStart;
+          if (duration > 5000) {
+             console.warn(`\n[!] Warning: Extremely slow file conversion (${duration.toFixed(0)}ms): ${relativePath}`);
+          }
           projectStats.fileProcessingTime += duration;
           
           sessionStats.slowestFiles.push({
@@ -493,8 +499,14 @@ async function main() {
 
   console.log("\n[6/6] Finalizing database (VACUUM)...");
   try {
-    execSync(`sqlite3 "${dbPath}" "VACUUM;"`, { stdio: "inherit" });
-  } catch (e) {}
+    // Use the client to VACUUM instead of sqlite3 CLI to ensure vector extensions compatibility
+    await client.execute("VACUUM;");
+  } catch (e: any) {
+    console.error("      Failed to VACUUM through client:", e.message);
+    try {
+       execSync(`sqlite3 "${dbPath}" "VACUUM;"`, { stdio: "ignore" });
+    } catch (innerE) {}
+  }
 
   printSummary();
 }
