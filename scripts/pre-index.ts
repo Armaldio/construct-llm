@@ -2,12 +2,17 @@ import { LibSQLVector } from "@mastra/libsql";
 import { MDocument } from "@mastra/rag";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { pipeline } from "@xenova/transformers";
+import { pipeline } from "@huggingface/transformers";
 import { PDFParse } from "pdf-parse";
 import { execSync } from "node:child_process";
-import { createClient } from "@libsql/client";
+import { createClient, type Client } from "@libsql/client";
 import crypto from "node:crypto";
 import { performance } from "node:perf_hooks";
+import type { FeatureExtractionPipeline } from "@huggingface/transformers";
+
+type Tensor = {
+  tolist(): any[][];
+};
 
 interface EmbedderResult {
   embeddings: number[][];
@@ -33,6 +38,7 @@ interface ProjectStats {
 const sessionStats = {
   startTime: 0,
   endTime: 0,
+  device: "unknown",
   projects: [] as ProjectStats[],
   slowestFiles: [] as FileStats[],
 };
@@ -40,38 +46,53 @@ const sessionStats = {
 const SCIRRA_EXAMPLES_URL = "https://github.com/Scirra/Construct-Example-Projects.git";
 const TEMP_DIR = path.resolve(process.cwd(), "temp_projects");
 
-// Setup Xenova local embedder wrapper
-class XenovaEmbedder {
-  private embedder: any;
+// Setup Transformers.js local embedder wrapper
+class TransformerEmbedder {
+  private embedder: FeatureExtractionPipeline | null = null;
   async initialize() {
     if (!this.embedder) {
-      this.embedder = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
+      try {
+        console.log("[Embedder] Initializing with WebGPU...");
+        this.embedder = (await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2", {
+          device: "webgpu",
+          dtype: "fp32",
+        })) as any;
+
+        // @ts-ignore - check actual device from the pipeline
+        const actualDevice = this.embedder?.device || "webgpu";
+        sessionStats.device = actualDevice;
+        console.log(`[Embedder] WebGPU initialized successfully. Device: ${actualDevice}`);
+      } catch (e) {
+        console.warn("[Embedder] WebGPU failed, falling back to WASM/CPU:", (e as Error).message);
+        this.embedder = (await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2")) as any;
+        // @ts-ignore
+        const actualDevice = this.embedder?.device || "cpu";
+        sessionStats.device = actualDevice;
+        console.log(`[Embedder] Fallback initialized. Device: ${actualDevice}`);
+      }
     }
   }
   async embed(texts: string[]): Promise<number[][]> {
     await this.initialize();
-    const outputs = await this.embedder(texts, { pooling: "mean", normalize: true });
-    // Convert to flat array of arrays
-    const num_texts = texts.length;
-    const dim = 384;
-    const result: number[][] = [];
-    for (let i = 0; i < num_texts; i++) {
-      const start = i * dim;
-      const end = (i + 1) * dim;
-      result.push(Array.from(outputs.data.slice(start, end)));
-    }
-    return result;
+    if (!this.embedder) throw new Error("Embedder not initialized");
+    const outputs = (await this.embedder(texts, {
+      pooling: "mean",
+      normalize: true,
+    })) as unknown as Tensor;
+
+    // In Transformers.js v3/v4, tolist() returns the nested array
+    return outputs.tolist() as number[][];
   }
 }
 
-const xenovaModel = new XenovaEmbedder();
+const transformerModel = new TransformerEmbedder();
 const embeddingModel = {
-  specificationVersion: "v1",
-  provider: "xenova",
+  specificationVersion: "v1" as const,
+  provider: "transformers-js",
   modelId: "Xenova/all-MiniLM-L6-v2",
   maxEmbeddingsPerCall: 100,
   async doEmbed({ values }: { values: string[] }): Promise<EmbedderResult> {
-    const embeddings = await xenovaModel.embed(values);
+    const embeddings = await transformerModel.embed(values);
     return { embeddings };
   },
 };
@@ -114,12 +135,14 @@ async function getAllFiles(dirPath: string, arrayOfFiles: string[] = []) {
 }
 
 // Optimized synchronous pruneJson to avoid microtask overhead
-function pruneJson(obj: any): any {
+function pruneJson(obj: unknown): unknown {
   if (Array.isArray(obj)) {
     return obj.map(pruneJson);
   } else if (obj !== null && typeof obj === "object") {
-    const newObj: any = {};
-    for (const key of Object.keys(obj)) {
+    const newObj: Record<string, unknown> = {};
+    const typedObj = obj as Record<string, unknown>;
+
+    for (const key of Object.keys(typedObj)) {
       // 1. GLOBAL PRUNING (Aggressive)
       if (
         [
@@ -144,16 +167,16 @@ function pruneJson(obj: any): any {
       }
 
       // 2. LAYOUT PRUNING
-      if (key === "tilemapData" && obj[key] && typeof obj[key] === "object") {
-        const { data, ...rest } = obj[key];
+      if (key === "tilemapData" && typedObj[key] && typeof typedObj[key] === "object") {
+        const { data, ...rest } = typedObj[key] as { data?: unknown; [key: string]: unknown };
         newObj[key] = rest;
         continue;
       }
 
-      if (key === "instances" && Array.isArray(obj[key])) {
-        const instances = obj[key] as any[];
-        const summarized: any[] = [];
-        const instanceGroups: Map<string, { count: number; data: any }> = new Map();
+      if (key === "instances" && Array.isArray(typedObj[key])) {
+        const instances = typedObj[key] as Record<string, unknown>[];
+        const summarized: unknown[] = [];
+        const instanceGroups: Map<string, { count: number; data: unknown }> = new Map();
 
         for (const inst of instances) {
           const { uid, world, ...rest } = inst;
@@ -170,7 +193,7 @@ function pruneJson(obj: any): any {
 
         for (const group of instanceGroups.values()) {
           if (group.count > 1) {
-            summarized.push({ ...group.data, _count: group.count });
+            summarized.push({ ...(group.data as object), _count: group.count });
           } else {
             summarized.push(group.data);
           }
@@ -180,7 +203,7 @@ function pruneJson(obj: any): any {
         continue;
       }
 
-      newObj[key] = pruneJson(obj[key]);
+      newObj[key] = pruneJson(typedObj[key]);
     }
     return newObj;
   }
@@ -249,9 +272,241 @@ async function downloadLatestManual() {
     } else {
       console.warn("[1/5] Could not find the manual download link. Using existing file.");
     }
-  } catch (e: any) {
-    console.error("[1/5] Failed to automate manual download:", e.message);
+  } catch (e: unknown) {
+    console.error("[1/5] Failed to automate manual download:", (e as Error).message);
   }
+}
+
+async function processAndUpsert(
+  vStore: LibSQLVector,
+  chunks: { text: string; metadata: Record<string, unknown> }[],
+  projectName: string,
+  indexName: string,
+) {
+  if (chunks.length === 0) return { embeddingTime: 0, upsertTime: 0 };
+
+  let totalEmbeddingTime = 0;
+  let totalUpsertTime = 0;
+
+  const vectors: number[][] = [];
+  const ids: string[] = [];
+  const metadata: Record<string, unknown>[] = [];
+
+  const batchSize = 50;
+  for (let i = 0; i < chunks.length; i += batchSize) {
+    const batch = chunks.slice(i, i + batchSize);
+    try {
+      const startEmbed = performance.now();
+      const res = await embeddingModel.doEmbed({ values: batch.map((c) => c.text) });
+      totalEmbeddingTime += performance.now() - startEmbed;
+
+      if (res && res.embeddings) {
+        res.embeddings.forEach((embeddingArray: number[], idx: number) => {
+          vectors.push(Array.from(embeddingArray));
+          const rawPath = (batch[idx].metadata.path as string) || "manual";
+          const chunkPath = rawPath.replace(/[^a-zA-Z0-9-]/g, "_");
+          ids.push(`${projectName}-${chunkPath}-${i + idx}`);
+          metadata.push(batch[idx].metadata);
+        });
+      }
+    } catch (err) {
+      console.error(`      Failed to embed batch starting at ${i}:`, err);
+    }
+  }
+
+  if (vectors.length > 0) {
+    try {
+      const startUpsert = performance.now();
+      await vStore.upsert({ indexName, vectors, ids, metadata });
+      totalUpsertTime += performance.now() - startUpsert;
+    } catch (upsertErr) {
+      console.error(
+        `      Failed to upsert ${vectors.length} vectors for ${projectName}:`,
+        upsertErr,
+      );
+    }
+  }
+
+  return { embeddingTime: totalEmbeddingTime, upsertTime: totalUpsertTime };
+}
+
+async function findProjectRoots(dir: string, allProjectRoots: string[]) {
+  if (!(await fs.stat(dir).catch(() => null))) return;
+  const files = await fs.readdir(dir);
+  if (files.indexOf("project.c3proj") !== -1) {
+    allProjectRoots.push(dir);
+    return;
+  }
+  for (const file of files) {
+    const fullPath = path.join(dir, file);
+    if (file === ".git" || file === "node_modules" || file === "temp_projects") continue;
+    if ((await fs.stat(fullPath).catch(() => ({ isDirectory: () => false }))).isDirectory()) {
+      await findProjectRoots(fullPath, allProjectRoots);
+    }
+  }
+}
+
+async function processNextProject(
+  client: Client,
+  vStore: LibSQLVector,
+  projectQueue: string[],
+  totalProjects: number,
+  completedCountRef: { value: number },
+) {
+  if (projectQueue.length === 0) return;
+  const resolvedPath = projectQueue.shift()!;
+  const projectName = path.basename(resolvedPath);
+  const currentId = ++completedCountRef.value;
+  const projectStart = performance.now();
+
+  const projectStats: ProjectStats = {
+    name: projectName,
+    duration: 0,
+    fileProcessingTime: 0,
+    embeddingTime: 0,
+    upsertTime: 0,
+    filesCount: 0,
+    chunksCount: 0,
+  };
+
+  try {
+    // Idempotency: Fetch existing hashes for this project
+    const existingRows = await client.execute({
+      sql: "SELECT metadata FROM snippet_content WHERE json_extract(metadata, '$.project') = ?",
+      args: [projectName],
+    });
+    const indexedFiles = new Map<string, string>();
+    for (const row of existingRows.rows) {
+      if (row.metadata) {
+        try {
+          const meta = JSON.parse(row.metadata as string);
+          if (meta.path && meta.hash) indexedFiles.set(meta.path, meta.hash);
+        } catch (e) {}
+      }
+    }
+
+    const allFiles = await getAllFiles(resolvedPath);
+    const allProjectChunks: { text: string; metadata: Record<string, unknown> }[] = [];
+    const filesToProcess: string[] = [];
+
+    // Pass 1: Quick hash check
+    for (const file of allFiles) {
+      const relativePath = path.relative(resolvedPath, file).replace(/\\/g, "/");
+      if (relativePath.includes(".uistate.json") || relativePath.includes(".git")) continue;
+
+      const content = await fs.readFile(file, "utf8");
+      const hash = crypto.createHash("sha256").update(content).digest("hex");
+
+      if (indexedFiles.get(relativePath) === hash) continue;
+
+      // Content changed or new file! Clear old chunks and re-index
+      await client.execute({
+        sql: "DELETE FROM snippet_content WHERE json_extract(metadata, '$.path') = ? AND json_extract(metadata, '$.project') = ?",
+        args: [relativePath, projectName],
+      });
+      filesToProcess.push(file);
+    }
+
+    if (filesToProcess.length === 0) {
+      console.log(
+        `[${new Date().toLocaleTimeString()}] (${currentId}/${totalProjects}) Skipping ${projectName} (No changes).`,
+      );
+      return processNextProject(client, vStore, projectQueue, totalProjects, completedCountRef);
+    }
+
+    // Pass 2: Parallel process dirty files
+    const FILE_CONCURRENCY = 10;
+    for (let i = 0; i < filesToProcess.length; i += FILE_CONCURRENCY) {
+      const batch = filesToProcess.slice(i, i + FILE_CONCURRENCY);
+      const results = await Promise.all(
+        batch.map(async (file) => {
+          const fileStart = performance.now();
+          const relativePath = path.relative(resolvedPath, file).replace(/\\/g, "/");
+          const content = await fs.readFile(file, "utf8");
+          const hash = crypto.createHash("sha256").update(content).digest("hex");
+
+          let processedContent = content;
+          if (file.endsWith(".json")) {
+            try {
+              const pruned = pruneJson(JSON.parse(content));
+              processedContent = JSON.stringify(pruned, null, 2);
+            } catch (e) {}
+          }
+
+          const fileType = relativePath.split("/")[0] || "root";
+          const doc = MDocument.fromText(
+            `Project: ${projectName}\nFile: ${relativePath}\nType: ${fileType}\nContent:\n${processedContent}`,
+            {
+              metadata: {
+                project: projectName,
+                path: relativePath,
+                type: "project-file",
+                fileType,
+                hash,
+              },
+            },
+          );
+
+          const docChunks = await doc.chunk({
+            strategy: "character",
+            maxSize: 1500,
+            overlap: 100,
+          });
+
+          const duration = performance.now() - fileStart;
+          if (duration > 5000) {
+            console.warn(
+              `\n[!] Warning: Extremely slow file conversion (${duration.toFixed(0)}ms): ${relativePath}`,
+            );
+          }
+          projectStats.fileProcessingTime += duration;
+
+          sessionStats.slowestFiles.push({
+            path: relativePath,
+            project: projectName,
+            duration,
+            chunks: docChunks.length,
+          });
+
+          return docChunks.map((c) => ({
+            text: c.text,
+            metadata: {
+              project: projectName,
+              path: relativePath,
+              type: "project-file",
+              fileType,
+              text: c.text,
+              hash,
+            },
+          }));
+        }),
+      );
+      results.forEach((chunks) => {
+        allProjectChunks.push(...chunks);
+        projectStats.chunksCount += chunks.length;
+      });
+      projectStats.filesCount += batch.length;
+    }
+
+    const timestamp = new Date().toLocaleTimeString();
+    process.stdout.write(
+      `[${timestamp}] (${currentId}/${totalProjects}) Indexing ${projectName} [${allProjectChunks.length} chunks from ${filesToProcess.length} changed files]...\n`,
+    );
+    const results = await processAndUpsert(
+      vStore,
+      allProjectChunks,
+      projectName,
+      "snippet_content",
+    );
+    projectStats.embeddingTime = results.embeddingTime;
+    projectStats.upsertTime = results.upsertTime;
+  } catch (e: unknown) {
+    console.error(`\n[!] Failed to index project ${projectName}:`, (e as Error).message);
+  } finally {
+    projectStats.duration = performance.now() - projectStart;
+    sessionStats.projects.push(projectStats);
+  }
+  await processNextProject(client, vStore, projectQueue, totalProjects, completedCountRef);
 }
 
 async function main() {
@@ -276,7 +531,7 @@ async function main() {
     .catch(() => false);
 
   console.log("[2/5] Initializing local embedding model (Xenova/all-MiniLM-L6-v2)...");
-  await xenovaModel.initialize();
+  await transformerModel.initialize();
   console.log("[2/5] Embedding model ready.");
 
   const vStore = new LibSQLVector({
@@ -292,59 +547,6 @@ async function main() {
 
   // Raw client for idempotency checks and cleanup
   const client = createClient({ url: `file:${dbPath}` });
-
-
-  const processAndUpsert = async (
-    chunks: { text: string; metadata: Record<string, any> }[],
-    projectName: string,
-    indexName: string,
-  ) => {
-    if (chunks.length === 0) return { embeddingTime: 0, upsertTime: 0 };
-
-    let totalEmbeddingTime = 0;
-    let totalUpsertTime = 0;
-
-    const vectors: number[][] = [];
-    const ids: string[] = [];
-    const metadata: Record<string, any>[] = [];
-
-    const batchSize = 50;
-    for (let i = 0; i < chunks.length; i += batchSize) {
-      const batch = chunks.slice(i, i + batchSize);
-      try {
-        const startEmbed = performance.now();
-        const res = await embeddingModel.doEmbed({ values: batch.map((c) => c.text) });
-        totalEmbeddingTime += performance.now() - startEmbed;
-
-        if (res && res.embeddings) {
-          res.embeddings.forEach((embeddingArray: any, idx: number) => {
-            vectors.push(Array.from(embeddingArray));
-            const rawPath = batch[idx].metadata.path || "manual";
-            const chunkPath = rawPath.replace(/[^a-zA-Z0-9-]/g, "_");
-            ids.push(`${projectName}-${chunkPath}-${i + idx}`);
-            metadata.push(batch[idx].metadata);
-          });
-        }
-      } catch (err) {
-        console.error(`      Failed to embed batch starting at ${i}:`, err);
-      }
-    }
-
-    if (vectors.length > 0) {
-      try {
-        const startUpsert = performance.now();
-        await vStore.upsert({ indexName, vectors, ids, metadata });
-        totalUpsertTime += performance.now() - startUpsert;
-      } catch (upsertErr) {
-        console.error(
-          `      Failed to upsert ${vectors.length} vectors for ${projectName}:`,
-          upsertErr,
-        );
-      }
-    }
-
-    return { embeddingTime: totalEmbeddingTime, upsertTime: totalUpsertTime };
-  };
 
   // 3.5 Index Manual if needed
   if (manualExists) {
@@ -362,13 +564,15 @@ async function main() {
 
         const manualChunks = chunks.map((c, i) => ({
           text: c.text,
-          metadata: { title: "Construct 3 Manual", text: c.text, page: i }, // Tools expect metadata.text
+          metadata: { title: "Construct 3 Manual", text: c.text, page: i, type: "manual" },
         }));
 
-        await processAndUpsert(manualChunks, "c3-manual", "manual_content");
+        await processAndUpsert(vStore, manualChunks, "c3-manual", "manual_content");
         console.log(`[3.5/5] Manual indexed (${manualChunks.length} chunks).`);
-      } catch (e: any) {
-        console.error("[3.5/5] Failed to index manual:", e.message);
+      } catch (e: unknown) {
+        console.error("[3.5/5] Failed to index manual:", (e as Error).message);
+      } finally {
+        // Cleanup manual parser if needed (though it's self-contained here)
       }
     } else {
       console.log("[3.5/5] Manual already indexed. Skipping.");
@@ -377,24 +581,8 @@ async function main() {
 
   // 4. Project Discovery
   const allProjectRoots: string[] = [];
-  async function findProjectRoots(dir: string) {
-    if (!(await fs.stat(dir).catch(() => null))) return;
-    const files = await fs.readdir(dir);
-    if (files.indexOf("project.c3proj") !== -1) {
-      allProjectRoots.push(dir);
-      return;
-    }
-    for (const file of files) {
-      const fullPath = path.join(dir, file);
-      if (file === ".git" || file === "node_modules" || file === "temp_projects") continue;
-      if ((await fs.stat(fullPath).catch(() => ({ isDirectory: () => false }))).isDirectory()) {
-        await findProjectRoots(fullPath);
-      }
-    }
-  }
-
   console.log("[5/5] Scanning directories for projects...");
-  await findProjectRoots(TEMP_DIR);
+  await findProjectRoots(TEMP_DIR, allProjectRoots);
 
   // Sort projects by size (largest first)
   console.log("[5/5] Calculating project sizes for optimal ordering...");
@@ -414,168 +602,24 @@ async function main() {
   console.log(`[5/5] Processing projects with concurrency: ${CONCURRENCY}`);
 
   const projectQueue = [...sortedProjectRoots];
-  let completedCount = 0;
+  const completedCountRef = { value: 0 };
 
   sessionStats.startTime = performance.now();
 
-  async function processNextProject() {
-    if (projectQueue.length === 0) return;
-    const resolvedPath = projectQueue.shift()!;
-    const projectName = path.basename(resolvedPath);
-    const currentId = ++completedCount;
-    const projectStart = performance.now();
-
-    const projectStats: ProjectStats = {
-      name: projectName,
-      duration: 0,
-      fileProcessingTime: 0,
-      embeddingTime: 0,
-      upsertTime: 0,
-      filesCount: 0,
-      chunksCount: 0,
-    };
-
-    try {
-      // Idempotency: Fetch existing hashes for this project
-      const existingRows = await client.execute({
-        sql: "SELECT metadata FROM snippet_content WHERE json_extract(metadata, '$.project') = ?",
-        args: [projectName],
-      });
-      const indexedFiles = new Map<string, string>();
-      for (const row of existingRows.rows) {
-        if (row.metadata) {
-          try {
-            const meta = JSON.parse(row.metadata as string);
-            if (meta.path && meta.hash) indexedFiles.set(meta.path, meta.hash);
-          } catch (e) {}
-        }
-      }
-
-      const allFiles = await getAllFiles(resolvedPath);
-      const allProjectChunks: { text: string; metadata: Record<string, any> }[] = [];
-      const filesToProcess: string[] = [];
-
-      // Pass 1: Quick hash check
-      for (const file of allFiles) {
-        const relativePath = path.relative(resolvedPath, file).replace(/\\/g, "/");
-        if (relativePath.includes(".uistate.json") || relativePath.includes(".git")) continue;
-
-        const content = await fs.readFile(file, "utf8");
-        const hash = crypto.createHash("sha256").update(content).digest("hex");
-
-        if (indexedFiles.get(relativePath) === hash) continue;
-
-        // Content changed or new file! Clear old chunks and re-index
-        await client.execute({
-          sql: "DELETE FROM snippet_content WHERE json_extract(metadata, '$.path') = ? AND json_extract(metadata, '$.project') = ?",
-          args: [relativePath, projectName],
-        });
-        filesToProcess.push(file);
-      }
-
-      if (filesToProcess.length === 0) {
-        console.log(
-          `[${new Date().toLocaleTimeString()}] (${currentId}/${totalProjects}) Skipping ${projectName} (No changes).`,
-        );
-        return processNextProject();
-      }
-
-      // Pass 2: Parallel process dirty files
-      const FILE_CONCURRENCY = 10;
-      for (let i = 0; i < filesToProcess.length; i += FILE_CONCURRENCY) {
-        const batch = filesToProcess.slice(i, i + FILE_CONCURRENCY);
-        const results = await Promise.all(
-          batch.map(async (file) => {
-            const fileStart = performance.now();
-            const relativePath = path.relative(resolvedPath, file).replace(/\\/g, "/");
-            const content = await fs.readFile(file, "utf8");
-            const hash = crypto.createHash("sha256").update(content).digest("hex");
-
-            let processedContent = content;
-            if (file.endsWith(".json")) {
-              try {
-                processedContent = JSON.stringify(pruneJson(JSON.parse(content)), null, 2);
-              } catch (e) {}
-            }
-
-            const fileType = relativePath.split("/")[0] || "root";
-            const doc = MDocument.fromText(
-              `Project: ${projectName}\nFile: ${relativePath}\nType: ${fileType}\nContent:\n${processedContent}`,
-              {
-                metadata: {
-                  project: projectName,
-                  path: relativePath,
-                  type: "project-file",
-                  fileType,
-                  hash,
-                },
-              },
-            );
-
-            const docChunks = await doc.chunk({
-              strategy: "character", // Faster and avoids regex backtracking in huge objects
-              maxSize: 1500,
-              overlap: 100,
-            });
-
-            const duration = performance.now() - fileStart;
-            if (duration > 5000) {
-              console.warn(
-                `\n[!] Warning: Extremely slow file conversion (${duration.toFixed(0)}ms): ${relativePath}`,
-              );
-            }
-            projectStats.fileProcessingTime += duration;
-
-            sessionStats.slowestFiles.push({
-              path: relativePath,
-              project: projectName,
-              duration,
-              chunks: docChunks.length,
-            });
-
-            return docChunks.map((c) => ({
-              text: c.text,
-              metadata: {
-                project: projectName,
-                path: relativePath,
-                type: "project-file",
-                fileType,
-                text: c.text,
-                hash,
-              },
-            }));
-          }),
-        );
-        results.forEach((chunks) => {
-          allProjectChunks.push(...chunks);
-          projectStats.chunksCount += chunks.length;
-        });
-        projectStats.filesCount += batch.length;
-      }
-
-      const timestamp = new Date().toLocaleTimeString();
-      process.stdout.write(
-        `[${timestamp}] (${currentId}/${totalProjects}) Indexing ${projectName} [${allProjectChunks.length} chunks from ${filesToProcess.length} changed files]...\n`,
-      );
-      const results = await processAndUpsert(allProjectChunks, projectName, "snippet_content");
-      projectStats.embeddingTime = results.embeddingTime;
-      projectStats.upsertTime = results.upsertTime;
-    } catch (e: any) {
-      console.error(`\n[!] Failed to index project ${projectName}:`, e.message);
-    } finally {
-      projectStats.duration = performance.now() - projectStart;
-      sessionStats.projects.push(projectStats);
-    }
-    await processNextProject();
-  }
-
-  await Promise.all(Array.from({ length: CONCURRENCY }).map(() => processNextProject()));
+  await Promise.all(
+    Array.from({ length: CONCURRENCY }).map(() =>
+      processNextProject(client, vStore, projectQueue, totalProjects, completedCountRef),
+    ),
+  );
 
   sessionStats.endTime = performance.now();
 
   console.log("\n[6/6] Finalizing database...");
   try {
+    console.log("      Optimizing and vacuuming...");
     await client.execute("PRAGMA optimize;");
+    await client.execute("PRAGMA wal_checkpoint(TRUNCATE);");
+    await client.execute("VACUUM;");
   } catch (e) {}
 
   await printSummary();
@@ -600,9 +644,11 @@ async function printSummary() {
   console.log("=".repeat(60));
   console.log(`Total Duration:      ${totalDuration.toFixed(2)}s`);
   console.log(`Total Database Size: ${dbSizeStr}`);
+  console.log(`Inference Device:    ${sessionStats.device.toUpperCase()}`);
   console.log(`Total Projects:      ${totalProjects}`);
   console.log(`Total Files Indexed: ${totalFiles}`);
   console.log(`Total Chunks:        ${totalChunks}`);
+
   console.log("-".repeat(60));
   console.log("PHASE BREAKDOWN (Wall time across concurrency):");
   console.log(

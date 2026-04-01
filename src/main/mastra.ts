@@ -1,4 +1,4 @@
-import { app } from "electron";
+import { app, type BrowserWindow } from "electron";
 import path from "node:path";
 import { LibSQLVector, LibSQLStore } from "@mastra/libsql";
 import { Memory } from "@mastra/memory";
@@ -20,33 +20,33 @@ export let projectStore: LibSQLVector | undefined;
 export let agentMemory: Memory | undefined;
 export let currentWorkspace: Workspace | undefined;
 
-export function getProjectStore() {
+export function getProjectStore(): LibSQLVector {
   if (!projectStore) {
     throw new Error("No project store initialized. Please load a project first.");
   }
   return projectStore;
 }
 
-export function getAgentMemory() {
+export function getAgentMemory(): Memory {
   if (!agentMemory) {
     throw new Error("No agent memory initialized. Please load a project first.");
   }
   return agentMemory;
 }
 
-export function setProjectStore(store: LibSQLVector) {
+export function setProjectStore(store: LibSQLVector): void {
   projectStore = store;
 }
 
-export function setAgentMemory(memory: Memory) {
+export function setAgentMemory(memory: Memory): void {
   agentMemory = memory;
 }
 
-export function setCurrentWorkspace(workspace: Workspace | undefined) {
+export function setCurrentWorkspace(workspace: Workspace | undefined): void {
   currentWorkspace = workspace;
 }
 
-export function getCurrentWorkspace() {
+export function getCurrentWorkspace(): Workspace | undefined {
   return currentWorkspace;
 }
 
@@ -59,11 +59,11 @@ export const pendingEmbeddings = new Map<
 let embeddingRequestId = 0;
 
 export const embeddingModel = {
-  specificationVersion: "v1",
+  specificationVersion: "v1" as const,
   provider: "webgpu",
   modelId: "Xenova/all-MiniLM-L6-v2",
   maxEmbeddingsPerCall: 100,
-  async doEmbed({ values }: { values: string[] }) {
+  async doEmbed({ values }: { values: string[] }): Promise<{ embeddings: number[][] }> {
     if (!globalMainWindow) {
       throw new Error("Cannot compute embeddings: UI window is not ready.");
     }
@@ -73,13 +73,13 @@ export const embeddingModel = {
       globalMainWindow!.webContents.send("request-embedding", { id, texts: values });
     });
   },
-} as any;
+};
 
 // A global reference to be set by the main index
-let globalMainWindow: any = null;
-export function setGlobalMainWindow(window: any) {
+let globalMainWindow: BrowserWindow | null = null;
+export function setGlobalMainWindow(window: BrowserWindow | null): void {
   globalMainWindow = window;
 }
-export function getGlobalMainWindow() {
+export function getGlobalMainWindow(): BrowserWindow | null {
   return globalMainWindow;
 }

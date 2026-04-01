@@ -27,7 +27,7 @@ export default defineConfig({
         "@libsql/client",
         "chokidar",
         "lodash",
-        "@xenova/transformers",
+        "@huggingface/transformers",
       ],
     },
     minify: false,

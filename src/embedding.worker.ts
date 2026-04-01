@@ -1,23 +1,28 @@
 import { pipeline, env } from "@huggingface/transformers";
+import type { FeatureExtractionPipeline } from "@huggingface/transformers";
 
 // Optional: Configure environment, disable local models if we want to fetch from HF Hub
 // Note: In an Electron app, fetching from HF hub is fine, it caches in browser storage.
 env.allowLocalModels = false;
 
-let embedder: any = null;
+interface Tensor {
+  tolist(): number[][];
+}
+
+let embedder: FeatureExtractionPipeline | null = null;
 
 self.onmessage = async (event: MessageEvent) => {
-  const { id, texts } = event.data;
+  const { id, texts } = event.data as { id: string; texts: string[] };
 
   try {
     if (!embedder) {
       console.log("[Worker] Initializing feature-extraction pipeline...");
       try {
         // Try to initialize with WebGPU
-        embedder = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2", {
+        embedder = (await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2", {
           device: "webgpu",
           dtype: "fp32",
-        });
+        })) as FeatureExtractionPipeline;
         console.log("[Worker] Pipeline initialized with WebGPU.");
       } catch (gpuError) {
         console.warn(
@@ -25,29 +30,25 @@ self.onmessage = async (event: MessageEvent) => {
           gpuError,
         );
         // Fallback to default WASM/CPU
-        embedder = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
+        embedder = (await pipeline(
+          "feature-extraction",
+          "Xenova/all-MiniLM-L6-v2",
+        )) as FeatureExtractionPipeline;
         console.log("[Worker] Pipeline initialized with WASM/CPU.");
       }
     }
 
-    const outputs = await embedder(texts, { pooling: "mean", normalize: true });
+    const outputs = (await embedder(texts, {
+      pooling: "mean",
+      normalize: true,
+    })) as unknown as Tensor;
 
-    // Ensure we handle the tensor output correctly
-    // The output tensor shape is [batch_size, sequence_length]
-    const num_texts = texts.length;
-    const dim = 384; // all-MiniLM-L6-v2 dimension
-    const result: number[][] = [];
-
-    // Outputs.data is a Float32Array
-    const dataArray = outputs.data;
-
-    for (let i = 0; i < num_texts; i++) {
-      result.push(Array.from(dataArray.slice(i * dim, (i + 1) * dim)));
-    }
+    // In Transformers.js v3/v4, tolist() returns the nested array
+    const result = outputs.tolist();
 
     self.postMessage({ id, embeddings: result });
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error("[Worker] Embedding error:", error);
-    self.postMessage({ id, error: error.message });
+    self.postMessage({ id, error: (error as Error).message });
   }
 };
