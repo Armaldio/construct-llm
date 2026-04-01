@@ -46,6 +46,7 @@ export interface Project {
   path: string;
   threads: ChatThread[];
   customPrompt?: string;
+  llmContext?: string;
 }
 
 export interface AppState {

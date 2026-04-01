@@ -53,6 +53,8 @@ export const architectAgent = new Agent({
     let inst = `${config.instructions}\n\nYou MUST use your tools to query the project state.`;
     const custom = requestContext?.get("customPrompt");
     if (custom) inst += `\n\n### USER CUSTOM INSTRUCTIONS:\n${custom}`;
+    const llmContext = requestContext?.get("llmContext");
+    if (llmContext) inst += `\n\n### PROJECT CONTEXT INSTRUCTIONS:\n${llmContext}`;
     return inst;
   },
   memory: getAgentMemory,
@@ -76,6 +78,8 @@ export const logicExpertAgent = new Agent({
     let inst = `${config.instructions}\n\nYou MUST use your tools to query project state.`;
     const custom = requestContext?.get("customPrompt");
     if (custom) inst += `\n\n### USER CUSTOM INSTRUCTIONS:\n${custom}`;
+    const llmContext = requestContext?.get("llmContext");
+    if (llmContext) inst += `\n\n### PROJECT CONTEXT INSTRUCTIONS:\n${llmContext}`;
     return inst;
   },
   memory: getAgentMemory,
@@ -99,6 +103,8 @@ export const generatorAgent = new Agent({
     let inst = `${config.instructions}`;
     const custom = requestContext?.get("customPrompt");
     if (custom) inst += `\n\n### USER CUSTOM INSTRUCTIONS:\n${custom}`;
+    const llmContext = requestContext?.get("llmContext");
+    if (llmContext) inst += `\n\n### PROJECT CONTEXT INSTRUCTIONS:\n${llmContext}`;
     return inst;
   },
   memory: getAgentMemory,
@@ -122,6 +128,8 @@ export const constructExpertAgent = new Agent({
     let inst = `${config.instructions}`;
     const custom = requestContext?.get("customPrompt");
     if (custom) inst += `\n\n### USER CUSTOM INSTRUCTIONS:\n${custom}`;
+    const llmContext = requestContext?.get("llmContext");
+    if (llmContext) inst += `\n\n### PROJECT CONTEXT INSTRUCTIONS:\n${llmContext}`;
     return inst;
   },
   memory: getAgentMemory,

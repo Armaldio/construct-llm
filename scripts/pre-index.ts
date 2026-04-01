@@ -122,7 +122,7 @@ async function getAllFiles(dirPath: string, arrayOfFiles: string[] = []) {
         )
           continue;
 
-        if ([".json", ".js", ".ts"].includes(ext)) {
+        if ([".json", ".js", ".ts", ".md"].includes(ext)) {
           arrayOfFiles.push(filePath);
         }
       }

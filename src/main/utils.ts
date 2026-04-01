@@ -32,7 +32,7 @@ export async function getAllFiles(dirPath: string, arrayOfFiles: string[] = []) 
         await getAllFiles(filePath, arrayOfFiles);
       } else {
         const ext = path.extname(file).toLowerCase();
-        if ([".json", ".js", ".ts"].includes(ext)) {
+        if ([".json", ".js", ".ts", ".md"].includes(ext)) {
           arrayOfFiles.push(filePath);
         }
       }
@@ -42,6 +42,15 @@ export async function getAllFiles(dirPath: string, arrayOfFiles: string[] = []) 
   }
 
   return arrayOfFiles;
+}
+
+export async function readProjectContext(projectPath: string): Promise<string | undefined> {
+  try {
+    const contextPath = path.join(projectPath, "llm-context.md");
+    return await fs.readFile(contextPath, "utf8");
+  } catch (e) {
+    return undefined;
+  }
 }
 
 // God Tier: Project Logic Brain
@@ -75,6 +84,12 @@ export async function buildProjectBrain(projectPath: string) {
   };
 
   try {
+    // 0. Scan for project-specific instructions
+    const project = appState.projects.find((p) => p.path === projectPath);
+    if (project) {
+      project.llmContext = await readProjectContext(projectPath);
+    }
+
     // 1. Scan project.c3proj for base metadata
     const projFile = path.join(projectPath, "project.c3proj");
     const projData = JSON.parse(await fs.readFile(projFile, "utf8"));

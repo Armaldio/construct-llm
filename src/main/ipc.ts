@@ -6,7 +6,7 @@ import { generateText } from "ai";
 
 import { appState, encryptedApiKeys, saveState, saveKeys, setAppState } from "./state";
 import { getGlobalMainWindow, pendingEmbeddings } from "./mastra";
-import { startWatchingProject } from "./utils";
+import { startWatchingProject, readProjectContext } from "./utils";
 import { AGENTS_MAP } from "./agents";
 import { setLastUsedModelConfig } from "./tools";
 import { ModelConfig } from "./types";
@@ -73,7 +73,8 @@ export function setupIpcHandlers() {
       const id = path.basename(projectPath);
       let p = appState.projects.find((pr) => pr.id === id);
       if (!p) {
-        p = { id, name: id, path: projectPath, threads: [] };
+        const llmContext = await readProjectContext(projectPath);
+        p = { id, name: id, path: projectPath, threads: [], llmContext };
         appState.projects.push(p);
         appState.activeProjectId = id;
         await saveState();
@@ -200,6 +201,7 @@ export function setupIpcHandlers() {
       const requestContext = new RequestContext();
       requestContext.set("modelConfig", currentConfig);
       requestContext.set("customPrompt", p.customPrompt);
+      requestContext.set("llmContext", p.llmContext);
 
       const result = await agent.stream(text, {
         maxSteps: 10,
